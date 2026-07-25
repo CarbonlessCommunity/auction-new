@@ -15,10 +15,20 @@ export function formatClock(seconds: number): string {
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
 }
 
-const money = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
-
+/**
+ * Bids are quoted in whatever unit the auction trades in, and the two ends of
+ * that range need different precision: energy is priced per kWh to five
+ * decimals (0.05376), where rounding to cents would collapse a whole auction
+ * into one number, while a freight lane or a bulk lot is quoted in currency
+ * units. Sub-unit prices therefore keep five decimals — trailing zeros and
+ * all, so the ladder stays aligned — and anything larger keeps two.
+ */
 export function formatValue(value: number): string {
-  return money.format(value);
+  const decimals = Math.abs(value) < 1 && value !== 0 ? 5 : 2;
+  return value.toLocaleString(undefined, {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
 }
 
 export function escapeHtml(value: string): string {

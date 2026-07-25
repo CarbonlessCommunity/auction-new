@@ -1,7 +1,9 @@
-import { Connection, api } from '../connection';
-import type { AuctionAggregate, StoredBid, StoredLot } from '../../shared/aggregate';
-import type { AuctionPhase, Role } from '../../shared/types';
+import { Connection } from '../connection';
+import type { AuctionAggregate, StoredLot } from '../../shared/aggregate';
+import type { AuctionPhase, BidDirection, Role } from '../../shared/types';
+import { MAX_BIDDERS, MAX_LOTS } from '../../shared/rules';
 import { bidderColor, escapeHtml, formatClock, formatValue, patch, toast } from '../format';
+import { exportBidsCsv, exportResultsCsv } from '../export';
 import { BidChart } from './chart';
 
 type Panel = 'lot' | 'person' | 'people' | 'rules' | null;
@@ -13,7 +15,7 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       <div class="inner">
         <h1 id="v-name">Loading…</h1>
         <div class="clock" id="v-clock"></div>
-        <span class="badge" id="v-badge"></span>
+        <span class="phase" id="v-phase"></span>
         <div class="grow"></div>
         <div class="whoami" id="v-who"></div>
       </div>
@@ -22,9 +24,12 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       <div class="controls" id="v-controls"></div>
       <div id="v-panel"></div>
       <div id="v-rules"></div>
-      <div class="board" id="v-board"></div>
-      <div class="card" id="v-chartcard" hidden>
-        <div class="chartwrap"><canvas id="v-chart"></canvas></div>
+      <div class="stage">
+        <div class="board" id="v-board"></div>
+        <div class="chartwrap" id="v-chartwrap" hidden>
+          <p class="chart-empty" id="v-chartempty">No Bids to Display</p>
+          <canvas id="v-chart"></canvas>
+        </div>
       </div>
     </main>
   `;
@@ -34,13 +39,14 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     topbar: root.querySelector<HTMLElement>('#topbar')!,
     name: root.querySelector<HTMLElement>('#v-name')!,
     clock: root.querySelector<HTMLElement>('#v-clock')!,
-    badge: root.querySelector<HTMLElement>('#v-badge')!,
+    phase: root.querySelector<HTMLElement>('#v-phase')!,
     who: root.querySelector<HTMLElement>('#v-who')!,
     controls: root.querySelector<HTMLElement>('#v-controls')!,
     panel: root.querySelector<HTMLElement>('#v-panel')!,
     rules: root.querySelector<HTMLElement>('#v-rules')!,
     board: root.querySelector<HTMLElement>('#v-board')!,
-    chartCard: root.querySelector<HTMLElement>('#v-chartcard')!,
+    chartWrap: root.querySelector<HTMLElement>('#v-chartwrap')!,
+    chartEmpty: root.querySelector<HTMLElement>('#v-chartempty')!,
   };
 
   let chart: BidChart | null = null;
@@ -56,34 +62,32 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
 
   function renderClock(agg: AuctionAggregate, phase: AuctionPhase): void {
     const { lastCallSec } = agg.config;
-    const remaining = phase.remainingSec;
 
-    // Two clocks, as in the original: the main clock runs down to the start of
-    // Last Call, then a separate Last Call clock counts out the blind window.
-    const inLastCall = phase.isInLastCall;
-    const shown = phase.isRunning ? (inLastCall ? remaining : remaining - lastCallSec) : agg.config.auctionLengthSec;
-    const label = !phase.isRunning ? (phase.isCompleted ? 'finished' : 'not started') : inLastCall ? 'last call' : 'remaining';
+    // Two clocks, as in the original: the main clock runs the bidding period
+    // down to zero, then a separate Last Call clock counts out the final
+    // window. `auctionLength` spans both, so the main clock has to subtract
+    // Last Call from it — including before the auction starts, where the
+    // opening 5:00 is what a supplier expects to see.
+    const shown = phase.isInLastCall ? phase.remainingSec : phase.remainingSec - lastCallSec;
 
-    el.clock.innerHTML = `${formatClock(shown)}<small>${label}</small>`;
+    // Once the clock has run out there is nothing left to count down, and the
+    // demo's finished board simply drops it.
+    el.clock.textContent = phase.isCompleted ? '' : formatClock(shown);
 
     const status = agg.showResultsReleased
-      ? { text: 'Results released', cls: 'done' }
+      ? { text: 'Results Released', cls: 'is-released' }
       : phase.isInLastCall
-        ? { text: 'Last call — blind', cls: 'lastcall' }
+        ? { text: 'Last Call', cls: 'is-lastcall' }
         : phase.isInExtendedTime
-          ? { text: 'Extended time', cls: 'extended' }
+          ? { text: 'Extended Time', cls: 'is-extended' }
           : phase.isRunning
-            ? { text: 'Live', cls: 'live' }
+            ? { text: '', cls: '' }
             : phase.isCompleted
-              ? { text: 'Awaiting results', cls: '' }
-              : { text: 'Not started', cls: '' };
+              ? { text: 'Awaiting Results', cls: '' }
+              : { text: 'Not Started', cls: '' };
 
-    el.badge.className = `badge ${status.cls}`;
-    el.badge.textContent = status.text;
-
-    el.topbar.className = `topbar ${
-      agg.showResultsReleased ? 'is-released' : phase.isInLastCall ? 'is-lastcall' : phase.isInExtendedTime ? 'is-extended' : ''
-    }`;
+    el.phase.textContent = status.text;
+    el.topbar.className = `topbar ${status.cls}`;
   }
 
   function renderControls(agg: AuctionAggregate, phase: AuctionPhase): void {
@@ -98,16 +102,17 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     if (notStarted) {
       buttons.push(`<button class="primary" data-act="start" ${agg.lots.size ? '' : 'disabled'}>Start auction</button>`);
       buttons.push('<button data-act="panel-rules">Rules</button>');
+      // Contract terms are fixed before bidding opens, so this goes away after.
+      buttons.push(`<button data-act="panel-lot" ${agg.lots.size >= MAX_LOTS ? 'disabled' : ''}>Add contract term</button>`);
     }
     if (!notStarted && !agg.showResultsReleased) {
       buttons.push(`<button class="primary" data-act="release">Release results</button>`);
     }
 
-    buttons.push('<button data-act="panel-lot">Add lot</button>');
     buttons.push('<button data-act="panel-person">Add participant</button>');
     buttons.push(`<button data-act="panel-people">People (${agg.users.size})</button>`);
-    buttons.push(`<a class="button" href="/api/auctions/${auctionId}/results.csv">Export results</a>`);
-    buttons.push(`<a class="button" href="/api/auctions/${auctionId}/bids.csv">Export bids</a>`);
+    buttons.push('<button data-act="export-results">Export results</button>');
+    buttons.push('<button data-act="export-bids">Export bids</button>');
 
     el.controls.innerHTML = buttons.join('');
   }
@@ -121,11 +126,14 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     if (panel === 'lot') {
       el.panel.innerHTML = `
         <form class="card panel" data-form="lot">
-          <h3>Add a lot</h3>
+          <h3>Add a contract term</h3>
           <div class="row">
-            <input class="grow" name="name" data-k="lot-name" placeholder="e.g. Lane 1 — Chicago to Dallas" required />
+            <input class="grow" name="name" data-k="lot-name" placeholder="e.g. 48 Months" required />
             <button class="primary">Add</button>
           </div>
+          <p class="muted" style="font-size:0.85rem;margin:0.6rem 0 0">
+            Up to ${MAX_LOTS} terms run side by side on one clock, and are fixed once bidding starts.
+          </p>
         </form>`;
       return;
     }
@@ -137,14 +145,14 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
           <div class="row">
             <input class="grow" name="name" data-k="person-name" placeholder="Name" required />
             <select name="role" style="width:auto">
-              <option value="bidder">Bidder</option>
-              <option value="viewer">Observer</option>
-              <option value="owner">Organiser</option>
+              <option value="bidder">${roleLabel('bidder')}</option>
+              <option value="viewer">${roleLabel('viewer')}</option>
+              <option value="owner">${roleLabel('owner')}</option>
             </select>
             <button class="primary">Add</button>
           </div>
           <p class="muted" style="font-size:0.85rem;margin:0.6rem 0 0">
-            You will get a private invite link to send them. Bidders never see each other's names.
+            You will get a private invite link to send them. Suppliers never see each other's names.
           </p>
         </form>`;
       return;
@@ -156,7 +164,7 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
           const link = inviteLinks.get(user.publicKey);
           return `
             <li>
-              <span class="grow">${escapeHtml(user.name)} <span class="role">${user.role}</span></span>
+              <span class="grow">${escapeHtml(user.name)} <span class="role">${roleLabel(user.role)}</span></span>
               <button class="link" data-act="invite" data-key="${user.publicKey}">
                 ${link ? 'new link' : 'get link'}
               </button>
@@ -186,6 +194,7 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
             <label><span>Length (s)</span><input type="number" name="auctionLengthSec" value="${c.auctionLengthSec}" min="10" /></label>
             <label><span>Extended time under (s)</span><input type="number" name="extendedTimeThresholdSec" value="${c.extendedTimeThresholdSec}" min="0" /></label>
             <label><span>Last call (s)</span><input type="number" name="lastCallSec" value="${c.lastCallSec}" min="0" /></label>
+            <label><span>Last call bidders</span><input type="number" name="lastCallBidders" value="${c.lastCallBidders}" min="0" max="${MAX_BIDDERS}" /></label>
             <label><span>Minimum step</span><input type="number" name="minBidStep" value="${c.minBidStep}" min="0" step="any" /></label>
           </div>
           <button class="primary">Save rules</button>
@@ -212,10 +221,13 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
           <button class="link" data-act="dismiss-rules">dismiss</button>
         </div>
         <ol>
-          <li>Only bids ${better} than the current best bid are accepted${c.minBidStep > 0 ? `, by at least ${formatValue(c.minBidStep)}` : ''}.</li>
+          <li>You may bid on any or all contract terms, and only bids ${better} than that term's current best are accepted${c.minBidStep > 0 ? `, by at least ${formatValue(c.minBidStep)}` : ''}.</li>
+          <li>You see every rival's price but never their name — only their colour.</li>
           <li>A leading bid with under ${formatClock(c.extendedTimeThresholdSec - c.lastCallSec)} left resets the clock to that mark — "Extended Time".</li>
-          <li>The final ${formatClock(c.lastCallSec)} is "Last Call": your bids are hidden from other bidders, and theirs from you.</li>
-          <li>Results appear once the organiser releases them.</li>
+          <li>The final ${formatClock(c.lastCallSec)} is "Last Call"${
+            c.lastCallBidders > 0 ? `, open only to each term's ${c.lastCallBidders} leading bidders` : ''
+          }: your bids are hidden from other bidders, and theirs from you.</li>
+          <li>Results appear once the auctioneer releases them, and the auctioneer may remove a bid made in error at any time.</li>
           <li>The best bidder is not guaranteed the business.</li>
         </ol>
       </div>`;
@@ -223,7 +235,9 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
 
   function renderBoard(agg: AuctionAggregate, phase: AuctionPhase): void {
     if (agg.lots.size === 0) {
-      el.board.innerHTML = `<div class="card muted">No lots yet.${isOwner() ? ' Add one to get started.' : ''}</div>`;
+      el.board.innerHTML = `<div class="card muted">No contract terms yet.${
+        isOwner() ? ' Add one to get started.' : ''
+      }</div>`;
       return;
     }
 
@@ -231,47 +245,57 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     const bidding = canBid() && phase.isRunning;
     const bidders = [...agg.users.values()].filter((user) => user.role === 'bidder');
 
-    const cards = [...agg.lots.values()]
+    const columns = [...agg.lots.values()]
       .sort((a, b) => a.insertionOrder - b.insertionOrder)
-      .map((lot) => lotCard(agg, lot, you.publicKey, bidding, bidders));
+      .map((lot) => lotColumn(agg, lot, phase, you.publicKey, bidding, bidders));
 
-    patch(el.board, cards.join(''));
+    patch(el.board, columns.join(''));
   }
 
-  function lotCard(
+  /**
+   * One contract term: a ladder of every supplier's own best price, best
+   * first. Suppliers are identified only by their colour on a bidder's screen
+   * — the outbound filter has already replaced rival names by the time we
+   * render — while the auctioneer and the client see who is behind each one.
+   */
+  function lotColumn(
     agg: AuctionAggregate,
     lot: StoredLot,
+    phase: AuctionPhase,
     yourKey: string,
     bidding: boolean,
     bidders: Array<{ publicKey: string; name: string }>,
   ): string {
-    // One row per bidder — their own best — as the original's `unique:'bidder'`.
-    const bestPerBidder = new Map<string, StoredBid>();
-    for (const bid of agg.bidsForLot(lot.id)) {
-      const current = bestPerBidder.get(bid.bidder);
-      if (!current || betterFor(agg, bid.value, current.value)) bestPerBidder.set(bid.bidder, bid);
-    }
-
-    const ranked = [...bestPerBidder.values()].sort((a, b) =>
-      agg.config.bidDirection === 'reverse' ? a.value - b.value : b.value - a.value,
-    );
+    const ranked = agg.standings(lot.id);
 
     const rows = ranked
       .map((bid, index) => {
         const user = agg.users.get(bid.bidder);
         return `
-          <li class="${index === 0 ? 'lead' : ''} ${bid.bidder === yourKey ? 'ours' : ''}"
+          <li class="bid ${index === 0 ? 'lead' : ''} ${bid.bidder === yourKey ? 'ours' : ''}"
               style="--bidder-color:${bidderColor(bid.bidder)}">
-            <span>${formatValue(bid.value)}</span>
+            <span class="price">${formatValue(bid.value)}</span>
             <span class="who">${escapeHtml(user?.name ?? 'Unknown')}</span>
-            ${isOwner() ? `<button class="link" data-act="cancel" data-seq="${bid.seq}">cancel</button>` : ''}
+            ${isOwner() ? `<button class="link" data-act="cancel" data-seq="${bid.seq}">remove</button>` : ''}
           </li>`;
       })
       .join('');
 
-    const best = ranked[0];
+    // Last Call hands the term to its leaders; everyone else can only watch.
+    const eligible = phase.isInLastCall ? agg.lastCallEligible(lot.id) : null;
+    const lockedOut = eligible !== null && !eligible.includes(yourKey);
+
+    const yourForm = !bidding
+      ? ''
+      : lockedOut
+        ? `<p class="locked">Last Call — open only to the ${agg.config.lastCallBidders} leading bidders on this term.</p>`
+        : `<form class="bidform" data-form="bid" data-lot="${lot.id}">
+             <input name="value" type="number" step="any" min="0" data-k="bid-${lot.id}" placeholder="Your bid" required />
+             <button class="primary">Bid</button>
+           </form>`;
+
     const onBehalf =
-      isOwner() && agg.phase(connection.now()).isRunning && bidders.length
+      isOwner() && phase.isRunning && bidders.length
         ? `<form class="bidform" data-form="behalf" data-lot="${lot.id}">
              <select name="bidder">
                ${bidders.map((b) => `<option value="${b.publicKey}">${escapeHtml(b.name)}</option>`).join('')}
@@ -282,36 +306,35 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
         : '';
 
     return `
-      <section class="card lot" data-lot="${lot.id}">
+      <section class="term" data-lot="${lot.id}">
         <header>
           <h2>${escapeHtml(lot.name)}</h2>
-          ${isOwner() ? `<button class="link" data-act="rename" data-lot="${lot.id}">rename</button>` : ''}
+          ${isOwner() && agg.startTime === null ? `<button class="link" data-act="rename" data-lot="${lot.id}">rename</button>` : ''}
         </header>
-        <div class="best ${best ? '' : 'none'}">${best ? formatValue(best.value) : 'No bids yet'}</div>
-        <ul class="bids">${rows}</ul>
-        ${
-          bidding
-            ? `<form class="bidform" data-form="bid" data-lot="${lot.id}">
-                 <input name="value" type="number" step="any" min="0" data-k="bid-${lot.id}" placeholder="Your bid" required />
-                 <button class="primary">Bid</button>
-               </form>`
-            : ''
-        }
+        ${rows ? `<ol class="ladder">${rows}</ol>` : '<p class="empty">(no bids)</p>'}
+        ${yourForm}
         ${onBehalf}
       </section>`;
   }
 
-  function betterFor(agg: AuctionAggregate, candidate: number, current: number): boolean {
-    return agg.config.bidDirection === 'reverse' ? candidate < current : candidate > current;
-  }
-
   function update(): void {
+    if (connection.authError) {
+      el.name.textContent = 'Access denied';
+      el.who.innerHTML = '';
+      el.controls.innerHTML = '';
+      el.panel.innerHTML = '';
+      el.rules.innerHTML = '';
+      el.board.innerHTML = `<div class="card muted">${escapeHtml(connection.authError)}</div>`;
+      el.chartWrap.hidden = true;
+      return;
+    }
+
     const agg = connection.agg;
     if (!agg || !connection.you) return;
 
     const phase = agg.phase(connection.now());
     el.name.textContent = agg.name;
-    el.who.innerHTML = `<strong>${escapeHtml(connection.you.name)}</strong><span class="muted">${connection.you.role}</span>`;
+    el.who.textContent = `${connection.you.name} (${roleLabel(connection.you.role)})`;
 
     renderClock(agg, phase);
     renderControls(agg, phase);
@@ -320,12 +343,16 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     renderBoard(agg, phase);
 
     if (agg.lots.size > 0) {
-      el.chartCard.hidden = false;
+      el.chartWrap.hidden = false;
       chart ??= new BidChart(root.querySelector<HTMLCanvasElement>('#v-chart')!);
-      chart.update(agg);
+      el.chartEmpty.hidden = chart.update(agg);
     }
 
     phaseKey = keyOf(phase, agg);
+  }
+
+  function roleLabel(role: Role): string {
+    return role === 'owner' ? 'auctioneer' : role === 'bidder' ? 'supplier' : 'viewer';
   }
 
   function keyOf(phase: AuctionPhase, agg: AuctionAggregate): string {
@@ -398,10 +425,7 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
 
     if (act === 'invite') {
       const key = target.dataset.key!;
-      const result = await api<{ ok: boolean; inviteUrl?: string; error?: string }>(
-        `/api/auctions/${auctionId}/users/${key}/invite`,
-        { method: 'POST' },
-      );
+      const result = await connection.createInvite(key);
       if (result.ok && result.inviteUrl) {
         inviteLinks.set(key, result.inviteUrl);
         update();
@@ -414,6 +438,16 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     if (act === 'copy') {
       await navigator.clipboard.writeText(target.dataset.link!);
       toast('Invite link copied.');
+      return;
+    }
+
+    if (act === 'export-results') {
+      if (connection.agg) exportResultsCsv(connection.agg);
+      return;
+    }
+
+    if (act === 'export-bids') {
+      if (connection.agg) exportBidsCsv(connection.agg);
     }
   });
 
@@ -456,19 +490,18 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       );
     } else if (kind === 'rules') {
       const body = {
-        bidDirection: data.get('bidDirection'),
+        bidDirection: data.get('bidDirection') as BidDirection,
         auctionLengthSec: Number(data.get('auctionLengthSec')),
         extendedTimeThresholdSec: Number(data.get('extendedTimeThresholdSec')),
         lastCallSec: Number(data.get('lastCallSec')),
+        lastCallBidders: Number(data.get('lastCallBidders')),
         minBidStep: Number(data.get('minBidStep')),
       };
-      const result = await api<{ ok: boolean; error?: string }>(`/api/auctions/${auctionId}/config`, {
-        method: 'PATCH',
-        body: JSON.stringify(body),
-      });
+      const result = await connection.updateConfig(body);
       if (result.ok) {
         toast('Rules saved.');
         panel = null;
+        update();
       } else {
         toast(result.error ?? 'Could not save rules.', 'error');
       }
@@ -497,6 +530,11 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
 
     const phase = agg.phase(connection.now());
     renderClock(agg, phase);
-    if (keyOf(phase, agg) !== phaseKey) update();
+    if (keyOf(phase, agg) === phaseKey) return;
+
+    // Crossing into Last Call changes what this viewer may see, and no event
+    // announces it — the clock alone opens the blind window.
+    connection.refold();
+    update();
   }, 250);
 }

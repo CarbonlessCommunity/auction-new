@@ -27,20 +27,22 @@ export class BidChart {
         scales: {
           x: {
             type: 'linear',
-            title: { display: true, text: 'seconds into auction' },
+            title: { display: true, text: 'duration (seconds)' },
             grid: { color: 'rgba(128,128,128,0.15)' },
           },
           y: {
-            title: { display: true, text: 'bid' },
             grid: { color: 'rgba(128,128,128,0.15)' },
           },
         },
-        plugins: { legend: { position: 'top' } },
+        plugins: {
+          legend: { position: 'top', align: 'end', labels: { usePointStyle: true, boxWidth: 8 } },
+        },
       },
     });
   }
 
-  update(agg: AuctionAggregate): void {
+  /** Redraws every contract term's leading price; false when nothing has been bid yet. */
+  update(agg: AuctionAggregate): boolean {
     const start = agg.startTime;
 
     const datasets = [...agg.lots.values()]
@@ -62,13 +64,15 @@ export class BidChart {
           data: points,
           borderColor: color,
           backgroundColor: color,
-          stepped: true as const,
-          pointRadius: 3,
+          borderWidth: 2,
+          pointRadius: 2.5,
         };
       });
 
     this.chart.data.datasets = datasets;
     this.chart.update();
+
+    return datasets.some((dataset) => dataset.data.length > 0);
   }
 
   destroy(): void {

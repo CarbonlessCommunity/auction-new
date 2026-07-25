@@ -27,6 +27,11 @@ export interface AuctionConfig {
   extendedTimeThresholdSec: number;
   /** Length of the blind bidding window right after the clock hits zero. */
   lastCallSec: number;
+  /**
+   * How many leading suppliers may still bid on a lot once Last Call opens.
+   * 0 turns the restriction off and lets everyone keep bidding.
+   */
+  lastCallBidders: number;
   /** Minimum required improvement over the current best bid (0 = any strictly better bid). */
   minBidStep: number;
 }

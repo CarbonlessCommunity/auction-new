@@ -1,0 +1,167 @@
+rules_version = '2';
+
+// Best-effort enforcement for a Spark-plan (no Cloud Functions) deployment.
+// There is no trusted server: everything here is what a signed-in anonymous
+// client can be made to prove using only its own uid and document reads.
+// What this CANNOT do — deliberately accepted trade-offs, see project notes:
+//   - Blind Last-Call secrecy: a technical reader can list `events` directly
+//     and see hidden bids; the client only hides them at render time.
+//   - Bidder anonymity: names/emails are visible to anyone signed in.
+//   - Bid arithmetic (beats-current-best, extended-time math, min-step):
+//     enforced client-side only (`validateInbound`), not re-derived here.
+// What this DOES enforce: only the real owner can issue admin events, only a
+// claimed bidder slot can bid as itself, events are append-only, and a user
+// slot can only ever be claimed once.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /auctions/{auctionId} {
+
+      function auction() {
+        return get(/databases/$(database)/documents/auctions/$(auctionId)).data;
+      }
+
+      function isOwner() {
+        return request.auth != null && auction().ownerUid == request.auth.uid;
+      }
+
+      // A signed-in writer's own slot, resolved via the uid-keyed claims
+      // mirror below instead of a query (rules can't run `where(...)`).
+      function claim() {
+        return get(/databases/$(database)/documents/auctions/$(auctionId)/claims/$(request.auth.uid)).data;
+      }
+
+      function hasClaim() {
+        return request.auth != null &&
+          exists(/databases/$(database)/documents/auctions/$(auctionId)/claims/$(request.auth.uid));
+      }
+
+      allow get: if request.auth != null;
+      // No `list` on the auction collection itself — auctions are only ever
+      // opened by a known id (from a URL), never enumerated.
+      allow list: if false;
+
+      allow create: if request.auth != null
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.nextSeq == 0
+        && request.resource.data.startedAt == null
+        && request.resource.data.showResults == false;
+
+      allow update: if (
+        isOwner()
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.createdAt == resource.data.createdAt
+        // seq only ever moves forward; mirror fields (name/startedAt/
+        // auctionLength/showResults) are cosmetic and owner-trusted.
+        && request.resource.data.nextSeq >= resource.data.nextSeq
+        // rules are frozen once the auction has actually started.
+        && (resource.data.startedAt == null || request.resource.data.config == resource.data.config)
+      ) || (
+        // A bidder's own placeBid submit() bumps this same mirrored counter
+        // (and, on Extended Time, auctionLength) alongside their event write —
+        // both writes land in one commit. Bid arithmetic is already
+        // client-trusted (see isAllowedBid), so trust the paired bump too:
+        // only nextSeq/auctionLength may move, and nextSeq by exactly one.
+        //
+        // auctionLength is the clock every participant reads, so unlike the
+        // other mirror fields it is NOT owner-trusted here and must be bounded:
+        // a bidder who could write it freely would be able to end the auction
+        // for everyone (0) or stall it indefinitely. Extended Time only ever
+        // pushes the clock back out to the threshold, so the largest legitimate
+        // bump is threshold - lastCall, and it never moves backwards.
+        hasClaim() && claim().role == 'bidder'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nextSeq', 'auctionLength'])
+        && request.resource.data.nextSeq == resource.data.nextSeq + 1
+        && request.resource.data.auctionLength >= resource.data.auctionLength
+        && request.resource.data.auctionLength <= resource.data.auctionLength
+             + (resource.data.config.extendedTimeThresholdSec - resource.data.config.lastCallSec)
+      );
+
+      allow delete: if false;
+
+      // ---- events/{eventId} : append-only log -----------------------------
+      match /events/{eventId} {
+        allow get, list: if request.auth != null;
+        allow update, delete: if false;
+
+        allow create: if request.auth != null
+          && request.resource.data.seq == auction().nextSeq
+          && isAllowedEvent();
+
+        function isAllowedEvent() {
+          let type = request.resource.data.type;
+          let ownerOnly = type in
+            ['setName', 'addUser', 'addLot', 'renameLot', 'cancelBid', 'startAuction', 'showResults'];
+          return (ownerOnly && isOwner()) || (type == 'placeBid' && isAllowedBid());
+        }
+
+        function isAllowedBid() {
+          let data = request.resource.data;
+          let withinWindow = auction().startedAt != null
+            // small grace window for clock drift / in-flight requests, not a
+            // meaningful security boundary given everything else here.
+            && request.time.toMillis() / 1000 <= auction().startedAt + auction().auctionLength + 5;
+          let onBehalf = 'placedBy' in data;
+          let asSelf = hasClaim() && claim().role == 'bidder' && claim().publicKey == data.bidder;
+          return withinWindow && (onBehalf ? isOwner() : asSelf);
+        }
+      }
+
+      // ---- users/{publicKey} : participant roster -------------------------
+      match /users/{publicKey} {
+        // No `list`: the roster is derived client-side by folding `addUser`
+        // events, so nothing legitimate ever queries this collection.
+        allow get: if request.auth != null;
+        allow list: if false;
+
+        allow create: if isOwner()
+          && (
+            request.resource.data.claimUid == null ||
+            // Only the bootstrap owner slot may arrive pre-claimed, and only
+            // by the auction's own owner claiming themselves.
+            (request.resource.data.claimUid == request.auth.uid
+              && request.resource.data.role == 'owner'
+              && request.auth.uid == auction().ownerUid)
+          );
+
+        // Write-once claim: an unclaimed slot may bind itself to the caller's
+        // uid via a matching invite, changing nothing else.
+        allow update: if request.auth != null
+          && resource.data.claimUid == null
+          && request.resource.data.claimUid == request.auth.uid
+          && request.resource.data.claimInviteId is string
+          && exists(/databases/$(database)/documents/auctions/$(auctionId)/invites/$(request.resource.data.claimInviteId))
+          && get(/databases/$(database)/documents/auctions/$(auctionId)/invites/$(request.resource.data.claimInviteId)).data.publicKey == publicKey
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimUid', 'claimInviteId']);
+
+        allow delete: if false;
+      }
+
+      // ---- invites/{inviteId} : bearer capability -------------------------
+      match /invites/{inviteId} {
+        // `get` only — never `list` — since an invite id is a bearer secret;
+        // listing the collection would hand out every capability at once.
+        allow get: if request.auth != null;
+        allow list: if false;
+        allow create: if isOwner();
+        allow update, delete: if false;
+      }
+
+      // ---- claims/{uid} : uid -> (publicKey, role) mirror -----------------
+      match /claims/{uid} {
+        allow get: if request.auth != null && request.auth.uid == uid;
+        allow list: if false;
+        // Create-only (first-claim-wins per uid), and only once the matching
+        // user doc already shows that uid as its claimant.
+        allow create: if request.auth != null && request.auth.uid == uid && (
+          (request.resource.data.role == 'owner' && auction().ownerUid == uid) ||
+          (
+            get(/databases/$(database)/documents/auctions/$(auctionId)/users/$(request.resource.data.publicKey)).data.claimUid == uid &&
+            get(/databases/$(database)/documents/auctions/$(auctionId)/users/$(request.resource.data.publicKey)).data.role == request.resource.data.role
+          )
+        );
+        allow update, delete: if false;
+      }
+    }
+  }
+}

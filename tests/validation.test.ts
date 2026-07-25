@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { filterOutbound } from '../src/server/validation';
+import { filterOutbound } from '../src/shared/validation';
 import { makeAuction, startedAuction, T0 } from './helpers';
 
 describe('bid acceptance', () => {
@@ -131,6 +131,97 @@ describe('blind last call', () => {
 
     expect(submit({ type: 'showResults' }, owner, now).ok).toBe(true);
     expect(filterOutbound(agg, hiddenEvent, bob, now)).not.toBeNull();
+  });
+});
+
+describe('last call is limited to the leading suppliers', () => {
+  /**
+   * Three suppliers on one term, ranked Bob 80 / Alice 90 / Carol 100 by the
+   * time the 60s Last Call window opens at T0+300.
+   */
+  const threeWay = () => {
+    const ctx = startedAuction();
+    const carol = ctx.addUser('Carol', 'bidder');
+
+    ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 100 }, carol, T0 + 10);
+    const aliceBid = ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 90 }, ctx.alice, T0 + 20);
+    ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 80 }, ctx.bob, T0 + 30);
+    if (!aliceBid.ok) throw new Error(aliceBid.error);
+
+    return { ...ctx, carol, aliceBid: aliceBid.event, inLastCall: T0 + 310 };
+  };
+
+  it('lets the two leaders keep bidding and turns everyone else away', () => {
+    const ctx = threeWay();
+
+    expect(ctx.agg.lastCallEligible(ctx.lot)).toEqual([ctx.bob.publicKey, ctx.alice.publicKey]);
+
+    expect(ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 70 }, ctx.carol, ctx.inLastCall).ok).toBe(false);
+    expect(ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 70 }, ctx.alice, ctx.inLastCall).ok).toBe(true);
+  });
+
+  it('re-ranks the field when the auctioneer removes a bid', () => {
+    const ctx = threeWay();
+
+    // Alice's 90 was placed in error, so Carol inherits second place — and
+    // with it the right to answer in Last Call.
+    expect(ctx.submit({ type: 'cancelBid', bidSeq: ctx.aliceBid.seq }, ctx.owner, T0 + 40).ok).toBe(true);
+
+    expect(ctx.agg.lastCallEligible(ctx.lot)).toEqual([ctx.bob.publicKey, ctx.carol.publicKey]);
+    expect(ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 70 }, ctx.carol, ctx.inLastCall).ok).toBe(true);
+  });
+
+  it('judges each contract term on its own standings', () => {
+    const ctx = startedAuction({}, ['12 Months', '24 Months']);
+    const carol = ctx.addUser('Carol', 'bidder');
+    const [twelve, twentyFour] = ctx.lots;
+
+    // Carol trails on the 12-month term but leads the 24-month one.
+    ctx.submit({ type: 'placeBid', lotId: twelve, value: 100 }, carol, T0 + 10);
+    ctx.submit({ type: 'placeBid', lotId: twelve, value: 90 }, ctx.alice, T0 + 20);
+    ctx.submit({ type: 'placeBid', lotId: twelve, value: 80 }, ctx.bob, T0 + 30);
+    ctx.submit({ type: 'placeBid', lotId: twentyFour, value: 200 }, ctx.alice, T0 + 40);
+    ctx.submit({ type: 'placeBid', lotId: twentyFour, value: 190 }, ctx.bob, T0 + 50);
+    ctx.submit({ type: 'placeBid', lotId: twentyFour, value: 180 }, carol, T0 + 60);
+
+    const at = T0 + 310;
+    expect(ctx.submit({ type: 'placeBid', lotId: twelve, value: 70 }, carol, at).ok).toBe(false);
+    expect(ctx.submit({ type: 'placeBid', lotId: twentyFour, value: 170 }, carol, at).ok).toBe(true);
+  });
+
+  it('stays open on a term too few suppliers ever bid on', () => {
+    const ctx = startedAuction();
+    ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 100 }, ctx.alice, T0 + 10);
+
+    expect(ctx.agg.lastCallEligible(ctx.lot)).toBeNull();
+    expect(ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 90 }, ctx.bob, T0 + 310).ok).toBe(true);
+  });
+
+  it('is switched off entirely when the rule is set to zero', () => {
+    const ctx = startedAuction({ lastCallBidders: 0 });
+    const carol = ctx.addUser('Carol', 'bidder');
+
+    ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 100 }, carol, T0 + 10);
+    ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 90 }, ctx.alice, T0 + 20);
+    ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 80 }, ctx.bob, T0 + 30);
+
+    expect(ctx.agg.lastCallEligible(ctx.lot)).toBeNull();
+    expect(ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 70 }, carol, T0 + 310).ok).toBe(true);
+  });
+});
+
+describe('standings', () => {
+  it('shows one row per supplier — their own best — leader first', () => {
+    const ctx = startedAuction();
+    ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 100 }, ctx.alice, T0 + 10);
+    ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 95 }, ctx.bob, T0 + 20);
+    ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 90 }, ctx.alice, T0 + 30);
+
+    const ranked = ctx.agg.standings(ctx.lot);
+    expect(ranked.map((bid) => [bid.bidder, bid.value])).toEqual([
+      [ctx.alice.publicKey, 90],
+      [ctx.bob.publicKey, 95],
+    ]);
   });
 });
 

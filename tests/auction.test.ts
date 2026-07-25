@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { AuctionAggregate } from '../src/shared/aggregate';
-import { parseConfig } from '../src/server/config';
-import { makeAuction, startedAuction, T0 } from './helpers';
+import { parseConfig } from '../src/shared/config';
+import { makeAuction, startedAuction, SYSTEM, T0 } from './helpers';
 
 describe('phases', () => {
   it('walks from not-started through extended time and last call to complete', () => {
     const ctx = makeAuction();
     const owner = ctx.addUser('Organiser', 'owner');
-    ctx.addLot('Lane 1');
+    ctx.addLot('12 Months');
 
     expect(ctx.agg.phase(T0).isRunning).toBe(false);
 
@@ -37,10 +37,48 @@ describe('phases', () => {
   });
 });
 
+describe('the default house clock', () => {
+  it('runs a five-minute bidding period, with Extended Time at 1:30 and a 60s Last Call', () => {
+    const { agg, config } = startedAuction();
+    // `auctionLength` spans the whole run, so the clock a supplier reads is
+    // always the remainder minus the Last Call window that follows it.
+    const displayed = (offset: number) => agg.phase(T0 + offset).remainingSec - config.lastCallSec;
+
+    expect(displayed(0)).toBe(5 * 60);
+    expect(agg.phase(T0 + 209).isInExtendedTime).toBe(false);
+
+    expect(agg.phase(T0 + 210).isInExtendedTime).toBe(true);
+    expect(displayed(210)).toBe(90);
+
+    expect(agg.phase(T0 + 300).isInLastCall).toBe(true);
+    expect(agg.phase(T0 + 300).remainingSec).toBe(60);
+  });
+});
+
+describe('limits', () => {
+  it('caps the bidding firms and the contract terms', () => {
+    const ctx = makeAuction();
+    ctx.addUser('Organiser', 'owner');
+    for (let i = 0; i < 12; i += 1) ctx.addUser(`Supplier ${i}`, 'bidder');
+
+    expect(ctx.submit({ type: 'addUser', name: 'One too many', role: 'bidder' }, SYSTEM).ok).toBe(false);
+    // The cap is on bidding firms, not on observers.
+    expect(ctx.submit({ type: 'addUser', name: 'The client', role: 'viewer' }, SYSTEM).ok).toBe(true);
+
+    for (let i = 0; i < 5; i += 1) ctx.addLot(`${(i + 1) * 12} Months`);
+    expect(ctx.submit({ type: 'addLot', name: '72 Months' }, SYSTEM).ok).toBe(false);
+  });
+
+  it('refuses a new contract term once bidding has started', () => {
+    const ctx = startedAuction();
+    expect(ctx.submit({ type: 'addLot', name: '48 Months' }, ctx.owner, T0 + 10).ok).toBe(false);
+  });
+});
+
 describe('replay', () => {
   it('reconstructs identical state by folding the event log', () => {
-    const ctx = startedAuction();
-    const second = ctx.addLot('Lane 2');
+    const ctx = startedAuction({}, ['12 Months', '24 Months']);
+    const second = ctx.lots[1];
 
     ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 100 }, ctx.alice, T0 + 10);
     ctx.submit({ type: 'placeBid', lotId: second, value: 900 }, ctx.bob, T0 + 20);
@@ -63,8 +101,8 @@ describe('replay', () => {
 
 describe('results', () => {
   it('picks the winner per lot and counts bids', () => {
-    const ctx = startedAuction();
-    const second = ctx.addLot('Lane 2');
+    const ctx = startedAuction({}, ['12 Months', '24 Months']);
+    const second = ctx.lots[1];
 
     ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 100 }, ctx.alice, T0 + 1);
     ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 80 }, ctx.bob, T0 + 2);
@@ -73,7 +111,7 @@ describe('results', () => {
     const results = ctx.agg.results();
     expect(results).toHaveLength(2);
 
-    expect(results[0].lot.name).toBe('Lane 1');
+    expect(results[0].lot.name).toBe('12 Months');
     expect(results[0].winner?.name).toBe('Bob');
     expect(results[0].bid?.value).toBe(80);
     expect(results[0].bidCount).toBe(2);

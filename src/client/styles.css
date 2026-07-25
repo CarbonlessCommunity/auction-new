@@ -81,7 +81,7 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1
 label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.7rem; }
 label > span { display: block; margin-bottom: 0.25rem; }
 
-.wrap { max-width: 1180px; margin: 0 auto; padding: 1.25rem; }
+.wrap { max-width: 1400px; margin: 0 auto; padding: 1.25rem; }
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -100,40 +100,32 @@ label > span { display: block; margin-bottom: 0.25rem; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 0.8rem; }
 
 /* --- top bar --- */
+/* The bar carries the auction's state as colour: dark while bidding is
+   ordinary, amber once Extended Time is live, hot orange in Last Call. */
 .topbar {
   position: sticky; top: 0; z-index: 10;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  transition: background-color 0.6s linear, border-color 0.6s linear;
+  background: #26282d;
+  color: #fff;
+  transition: background-color 0.6s linear;
 }
 .topbar .inner {
-  max-width: 1180px; margin: 0 auto; padding: 0.7rem 1.25rem;
-  display: flex; align-items: center; gap: 1rem;
+  max-width: 1400px; margin: 0 auto; padding: 0.5rem 1.25rem;
+  display: flex; align-items: center; gap: 1.1rem;
 }
-.topbar h1 { font-size: 1.05rem; }
+.topbar h1 { font-size: 0.95rem; font-weight: 600; }
 .clock {
   font-variant-numeric: tabular-nums;
-  font-size: 2rem; font-weight: 650; line-height: 1;
+  font-size: 1.6rem; font-weight: 650; line-height: 1.1;
 }
-.clock small { display: block; font-size: 0.65rem; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.clock:empty { display: none; }
 
-.badge {
-  padding: 0.2rem 0.6rem; border-radius: 999px;
-  font-size: 0.75rem; font-weight: 650; letter-spacing: 0.03em; text-transform: uppercase;
-  background: var(--surface-2); color: var(--muted);
-  border: 1px solid var(--border);
-}
-.badge.live { background: var(--accent); color: var(--accent-text); border-color: transparent; }
-.badge.extended { background: var(--warn); color: #1a1206; border-color: transparent; }
-.badge.lastcall { background: var(--hot); color: #fff; border-color: transparent; }
-.badge.done { background: var(--good); color: #04120a; border-color: transparent; }
+.phase { font-size: 0.8rem; font-weight: 600; letter-spacing: 0.02em; opacity: 0.9; }
 
-.topbar.is-extended { background: color-mix(in srgb, var(--warn) 12%, var(--surface)); }
-.topbar.is-lastcall { background: color-mix(in srgb, var(--hot) 14%, var(--surface)); }
-.topbar.is-released { background: color-mix(in srgb, var(--good) 12%, var(--surface)); }
+.topbar.is-extended { background: #c2701e; }
+.topbar.is-lastcall { background: #e2620f; }
+.topbar.is-released { background: #17794a; }
 
-.whoami { text-align: right; font-size: 0.85rem; line-height: 1.25; }
-.whoami strong { display: block; }
+.whoami { font-size: 0.75rem; opacity: 0.85; }
 
 /* --- owner controls --- */
 .controls { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 1rem; }
@@ -146,33 +138,55 @@ label > span { display: block; margin-bottom: 0.25rem; }
 .people .role { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
 
 /* --- board --- */
-.board {
-  display: grid; gap: 1rem; margin-bottom: 1.25rem;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+/* Terms on the left, the price history for all of them on the right. */
+.stage {
+  display: grid; gap: 1.5rem; align-items: start;
+  /* The terms column is `auto` so it only takes the width it needs — but its
+     max-content width grows with every bid card and bid form, and left alone it
+     will eat the whole row and starve the chart to 0px. The floor on the second
+     track is what keeps the chart on screen; the terms shrink instead. */
+  grid-template-columns: minmax(0, auto) minmax(20rem, 1fr);
 }
-.lot { display: flex; flex-direction: column; gap: 0.7rem; }
-.lot header { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
-.lot h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
-.lot .best { font-size: 1.75rem; font-weight: 700; font-variant-numeric: tabular-nums; }
-.lot .best.none { font-size: 1rem; font-weight: 500; color: var(--muted); }
+.board { display: flex; gap: 0.75rem; align-items: start; }
+/* Capped because a term's max-content width is set by its bid form, not by the
+   prices it shows — uncapped, five terms would push the chart off the row. */
+.term { display: flex; flex-direction: column; gap: 0.4rem; min-width: 8.5rem; max-width: 12rem; }
+.term header { display: flex; align-items: baseline; gap: 0.4rem; }
+.term h2 { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.term .empty { margin: 0; font-size: 0.8rem; color: var(--muted); }
+.term .locked { margin: 0.2rem 0 0; font-size: 0.72rem; color: var(--muted); }
 
-.bids { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; }
-.bids li {
-  display: flex; align-items: center; gap: 0.5rem;
-  padding: 0.35rem 0.55rem; border-radius: 7px;
-  background: var(--surface-2);
-  border-left: 4px solid var(--bidder-color, var(--border));
+.ladder { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.4rem; }
+/* A supplier's colour is their whole identity on a rival's screen, so it fills
+   the card rather than trimming it. The palette is light by design — keep the
+   text dark in both themes so it stays legible on top. */
+.bid {
+  background: var(--bidder-color, var(--surface-2));
+  color: #1a1d23;
+  border-radius: 5px;
+  padding: 0.4rem 0.3rem;
+  text-align: center;
   font-variant-numeric: tabular-nums;
 }
-.bids li.ours { outline: 1.5px solid var(--accent); }
-.bids li.lead { font-weight: 650; }
-.bids .who { flex: 1; font-size: 0.85rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bid .price { display: block; font-size: 0.85rem; font-weight: 600; }
+.bid .who { display: block; font-size: 0.68rem; opacity: 0.75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bid.lead { box-shadow: inset 0 0 0 2px rgba(0, 0, 0, 0.35); }
+.bid.ours { outline: 2px solid var(--accent); outline-offset: 1px; }
+.bid .link { color: #1a1d23; opacity: 0.7; }
 
-.bidform { display: flex; flex-wrap: wrap; gap: 0.4rem; }
-.bidform input { flex: 1 1 6rem; min-width: 0; }
-.bidform select { flex: 1 1 8rem; min-width: 0; }
+.bidform { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.2rem; }
+.bidform input { flex: 1 1 5rem; min-width: 0; }
+/* Only the auctioneer's bid-on-behalf-of form has a select, and supplier names
+   are long. Give it its own row so amount + Bid still share the one below. */
+.bidform select { flex: 1 1 100%; min-width: 0; }
 
-.chartwrap { position: relative; height: 340px; }
+.chartwrap { position: relative; height: 380px; }
+.chart-empty {
+  position: absolute; inset: 0; margin: 0;
+  display: grid; place-items: center;
+  font-weight: 600; color: var(--muted);
+}
+.chart-empty[hidden] { display: none; }
 
 .rules { font-size: 0.9rem; }
 .rules ol { margin: 0.5rem 0 0; padding-left: 1.2rem; }
@@ -198,8 +212,16 @@ label > span { display: block; margin-bottom: 0.25rem; }
   background: var(--hot); color: #fff; text-align: center; font-weight: 600; z-index: 200;
 }
 
+/* Below this, five terms plus a 20rem chart no longer fit side by side, so the
+   chart drops under the board instead of squeezing it. */
+@media (max-width: 1180px) {
+  .stage { grid-template-columns: minmax(0, 1fr); }
+  .board { flex-wrap: wrap; }
+  .term { flex: 1 1 8.5rem; }
+}
+
 @media (max-width: 640px) {
   .topbar .inner { flex-wrap: wrap; gap: 0.5rem 0.8rem; }
-  .clock { font-size: 1.5rem; }
+  .clock { font-size: 1.4rem; }
   .grid-2 { grid-template-columns: 1fr; }
 }

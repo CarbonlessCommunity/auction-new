@@ -1,6 +1,6 @@
-import type { AuctionEvent, InboundEventInput, Role } from '../shared/types';
-import { AuctionAggregate, type StoredBid, type StoredUser } from '../shared/aggregate';
-import { beatsBest } from '../shared/rules';
+import type { AuctionEvent, InboundEventInput, Role } from './types';
+import { AuctionAggregate, type StoredBid, type StoredUser } from './aggregate';
+import { beatsBest, MAX_BIDDERS, MAX_LOTS } from './rules';
 
 /**
  * Bidirectional validation, ported from `validation.py`.
@@ -18,6 +18,12 @@ export type InboundResult =
 
 const fail = (error: string): InboundResult => ({ ok: false, error });
 
+function countBidders(agg: AuctionAggregate): number {
+  let total = 0;
+  for (const user of agg.users.values()) if (user.role === 'bidder') total += 1;
+  return total;
+}
+
 export function validateInbound(
   agg: AuctionAggregate,
   input: InboundEventInput,
@@ -32,12 +38,19 @@ export function validateInbound(
       return { ok: true, event };
 
     case 'addUser': {
+      if (input.role === 'bidder' && countBidders(agg) >= MAX_BIDDERS) {
+        return fail(`An auction can have at most ${MAX_BIDDERS} bidding firms.`);
+      }
       // Public keys are sequential, matching the original's `len(self.users)`.
       event.publicKey = String(agg.users.size);
       return { ok: true, event };
     }
 
     case 'addLot': {
+      // Contract terms are fixed before bidding opens — adding one mid-auction
+      // would hand it a clock that is already most of the way through.
+      if (agg.startTime !== null) return fail('Contract terms cannot be added once the auction has started.');
+      if (agg.lots.size >= MAX_LOTS) return fail(`An auction can run at most ${MAX_LOTS} contract terms at once.`);
       event.lotId = `lot-${agg.lots.size}`;
       return { ok: true, event };
     }
@@ -95,6 +108,19 @@ function inboundPlaceBid(
 
   const bidder = agg.users.get(bidderKey);
   if (!bidder || bidder.role !== 'bidder') return fail('Only bidders are allowed to bid.');
+
+  // Last Call narrows each contract term to its leading suppliers. Ranked at
+  // the instant the window opened, so nothing a rival does inside the blind
+  // window can push someone out of it mid-bid.
+  if (agg.phase(now).isInLastCall) {
+    const eligible = agg.lastCallEligible(input.lotId);
+    if (eligible && !eligible.includes(bidderKey)) {
+      const leading = agg.config.bidDirection === 'reverse' ? 'lowest' : 'highest';
+      return fail(
+        `Last Call on this contract term is open only to its ${agg.config.lastCallBidders} ${leading} bidders.`,
+      );
+    }
+  }
 
   // Validate against what the actor can see, never the true best — otherwise a
   // rejection would leak the existence of a rival's hidden Last Call bid.

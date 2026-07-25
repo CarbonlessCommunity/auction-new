@@ -176,6 +176,23 @@ export class AuctionAggregate {
     return this.activeBids().filter((bid) => bid.lotId === lotId);
   }
 
+  /**
+   * Each supplier's own best bid on a lot, leader first — one row per bidder,
+   * which is how the board ladders them. `before` restricts the fold to bids
+   * placed strictly earlier than that instant.
+   */
+  standings(lotId: string, before?: number): StoredBid[] {
+    const best = new Map<string, StoredBid>();
+    for (const bid of this.bidsForLot(lotId)) {
+      if (before !== undefined && bid.time >= before) continue;
+      const current = best.get(bid.bidder);
+      if (!current || beatsBest(bid.value, current.value, this.config)) best.set(bid.bidder, bid);
+    }
+    return [...best.values()].sort((a, b) =>
+      this.config.bidDirection === 'reverse' ? a.value - b.value : b.value - a.value,
+    );
+  }
+
   /** The true leading bid for a lot, ignoring visibility rules. */
   bestBidFor(lotId: string): StoredBid | null {
     let best: StoredBid | null = null;
@@ -183,6 +200,29 @@ export class AuctionAggregate {
       if (best === null || beatsBest(bid.value, best.value, this.config)) best = bid;
     }
     return best;
+  }
+
+  /**
+   * The public keys of the suppliers still allowed to bid on `lotId` during
+   * Last Call — the `lastCallBidders` leaders as the standings stood the
+   * instant the window opened, so a blind bid placed inside it can never
+   * change who is entitled to answer it.
+   *
+   * Returns null when the restriction does not apply: the rule is switched
+   * off, the window has not opened, or too few suppliers had bid on this term
+   * to name a leading pair — narrowing to nobody would simply strand a term
+   * nobody wanted. Cancelling a bid re-ranks this, which is what lets the
+   * auctioneer undo a mistaken bid that pushed the wrong supplier into the
+   * final two.
+   */
+  lastCallEligible(lotId: string): string[] | null {
+    const keep = this.config.lastCallBidders;
+    const start = this.blindStart();
+    if (keep <= 0 || start === null) return null;
+
+    const ranked = this.standings(lotId, start);
+    if (ranked.length < keep) return null;
+    return ranked.slice(0, keep).map((bid) => bid.bidder);
   }
 
   /** True when `viewer` is not allowed to see `bid` (blind Last Call rule). */

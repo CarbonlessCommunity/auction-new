@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { InboundEventInput, Role } from '../shared/types';
+import type { InboundEventInput, Role } from './types';
 
 /**
  * Replaces the original `schema/*.json` JSON-Schema files. Each event has a

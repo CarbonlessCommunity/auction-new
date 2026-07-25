@@ -1,7 +1,7 @@
 import { AuctionAggregate, type StoredUser } from '../src/shared/aggregate';
 import type { AuctionConfig, AuctionEvent, InboundEventInput, Role } from '../src/shared/types';
-import { parseConfig } from '../src/server/config';
-import { validateInbound, type InboundResult } from '../src/server/validation';
+import { parseConfig } from '../src/shared/config';
+import { validateInbound, type InboundResult } from '../src/shared/validation';
 
 export const T0 = 1_000_000;
 
@@ -42,16 +42,19 @@ export function makeAuction(config: Partial<AuctionConfig> = {}) {
   return { agg, config: parsed, log, submit, addUser, addLot };
 }
 
-/** Owner, two bidders, one lot, auction started at T0. */
-export function startedAuction(config: Partial<AuctionConfig> = {}) {
+/**
+ * Owner, two bidders and the given contract terms, started at T0. Terms have
+ * to be named up front: the validator refuses to add one once the clock runs.
+ */
+export function startedAuction(config: Partial<AuctionConfig> = {}, terms: string[] = ['12 Months']) {
   const ctx = makeAuction(config);
   const owner = ctx.addUser('Organiser', 'owner');
   const alice = ctx.addUser('Alice', 'bidder');
   const bob = ctx.addUser('Bob', 'bidder');
-  const lot = ctx.addLot('Lane 1');
+  const lots = terms.map((term) => ctx.addLot(term));
 
   const started = ctx.submit({ type: 'startAuction' }, owner, T0);
   if (!started.ok) throw new Error(started.error);
 
-  return { ...ctx, owner, alice, bob, lot };
+  return { ...ctx, owner, alice, bob, lots, lot: lots[0] };
 }

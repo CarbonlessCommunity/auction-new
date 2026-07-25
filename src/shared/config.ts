@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import type { AuctionConfig } from '../shared/types';
-import { DEFAULT_CONFIG } from '../shared/rules';
+import type { AuctionConfig } from './types';
+import { DEFAULT_CONFIG, MAX_BIDDERS } from './rules';
 
 export { DEFAULT_CONFIG };
 
@@ -10,6 +10,7 @@ export const configSchema = z
     auctionLengthSec: z.number().int().min(10).max(24 * 60 * 60).default(DEFAULT_CONFIG.auctionLengthSec),
     extendedTimeThresholdSec: z.number().int().min(0).max(24 * 60 * 60).default(DEFAULT_CONFIG.extendedTimeThresholdSec),
     lastCallSec: z.number().int().min(0).max(24 * 60 * 60).default(DEFAULT_CONFIG.lastCallSec),
+    lastCallBidders: z.number().int().min(0).max(MAX_BIDDERS).default(DEFAULT_CONFIG.lastCallBidders),
     minBidStep: z.number().min(0).default(DEFAULT_CONFIG.minBidStep),
   })
   .superRefine((cfg, ctx) => {
