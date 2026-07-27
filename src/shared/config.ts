@@ -14,13 +14,9 @@ export const configSchema = z
     minBidStep: z.number().min(0).default(DEFAULT_CONFIG.minBidStep),
   })
   .superRefine((cfg, ctx) => {
-    if (cfg.lastCallSec > cfg.extendedTimeThresholdSec) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['lastCallSec'],
-        message: 'lastCallSec must be less than or equal to extendedTimeThresholdSec',
-      });
-    }
+    // Both are read off the main clock now, so the only relationship that has
+    // to hold is that the Extended Time mark falls somewhere on it. Last Call
+    // runs after that clock reaches zero and is independent of the threshold.
     if (cfg.extendedTimeThresholdSec > cfg.auctionLengthSec) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

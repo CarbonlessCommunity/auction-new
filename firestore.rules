@@ -6,12 +6,13 @@ rules_version = '2';
 // What this CANNOT do — deliberately accepted trade-offs, see project notes:
 //   - Blind Last-Call secrecy: a technical reader can list `events` directly
 //     and see hidden bids; the client only hides them at render time.
-//   - Bidder anonymity: names/emails are visible to anyone signed in.
 //   - Bid arithmetic (beats-current-best, extended-time math, min-step):
 //     enforced client-side only (`validateInbound`), not re-derived here.
 // What this DOES enforce: only the real owner can issue admin events, only a
-// claimed bidder slot can bid as itself, events are append-only, and a user
-// slot can only ever be claimed once.
+// claimed bidder slot can bid as itself, a supplier can withdraw only their own
+// bid, an observer can write nothing at all, events are append-only, a user slot
+// can only ever be claimed once, and — see `identities` below — a supplier
+// cannot read any other supplier's name or email by any route.
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -67,14 +68,14 @@ service cloud.firestore {
         // other mirror fields it is NOT owner-trusted here and must be bounded:
         // a bidder who could write it freely would be able to end the auction
         // for everyone (0) or stall it indefinitely. Extended Time only ever
-        // pushes the clock back out to the threshold, so the largest legitimate
-        // bump is threshold - lastCall, and it never moves backwards.
+        // pushes the main clock back out to the threshold, so the largest
+        // legitimate bump is the threshold itself, and it never moves backwards.
         hasClaim() && claim().role == 'bidder'
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nextSeq', 'auctionLength'])
         && request.resource.data.nextSeq == resource.data.nextSeq + 1
         && request.resource.data.auctionLength >= resource.data.auctionLength
         && request.resource.data.auctionLength <= resource.data.auctionLength
-             + (resource.data.config.extendedTimeThresholdSec - resource.data.config.lastCallSec)
+             + resource.data.config.extendedTimeThresholdSec
       );
 
       allow delete: if false;
@@ -91,8 +92,24 @@ service cloud.firestore {
         function isAllowedEvent() {
           let type = request.resource.data.type;
           let ownerOnly = type in
-            ['setName', 'addUser', 'addLot', 'renameLot', 'cancelBid', 'startAuction', 'showResults'];
-          return (ownerOnly && isOwner()) || (type == 'placeBid' && isAllowedBid());
+            ['setName', 'addUser', 'addLot', 'renameLot', 'startAuction', 'showResults'];
+          return (ownerOnly && isOwner())
+            || (type == 'placeBid' && isAllowedBid())
+            || (type == 'cancelBid' && isAllowedCancel());
+        }
+
+        // The auctioneer may withdraw any bid; a supplier only their own. A
+        // cancellation names the bid's owner in `bidder` — rules cannot follow
+        // `bidSeq` to the bid document, so this checks the *claim* against that
+        // name, and the client fold refuses any cancellation whose named owner
+        // is not the target bid's actual bidder. A supplier can therefore only
+        // write a cancellation naming themselves, which can only ever take
+        // effect on one of their own bids.
+        function isAllowedCancel() {
+          return isOwner() || (
+            hasClaim() && claim().role == 'bidder'
+            && request.resource.data.bidder == claim().publicKey
+          );
         }
 
         function isAllowedBid() {
@@ -107,7 +124,13 @@ service cloud.firestore {
         }
       }
 
-      // ---- users/{publicKey} : participant roster -------------------------
+      // ---- users/{publicKey} : claimable slots ----------------------------
+      //
+      // Readable by any signed-in client, because the invite handshake has to
+      // read a slot before it holds a claim of its own. That is only safe
+      // because these docs carry nothing identifying — just the role, the
+      // public label ("Supplier C") and the palette slot. Names live in
+      // `identities` below.
       match /users/{publicKey} {
         // No `list`: the roster is derived client-side by folding `addUser`
         // events, so nothing legitimate ever queries this collection.
@@ -135,6 +158,29 @@ service cloud.firestore {
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimUid', 'claimInviteId']);
 
         allow delete: if false;
+      }
+
+      // ---- identities/{publicKey} : real names, access-controlled ---------
+      //
+      // The one collection in this app that is genuinely secret from a
+      // supplier. Everything else — the log, the roster, the bids — is
+      // readable by any signed-in client, so a supplier's firm cannot be
+      // stored in any of them. It lives here instead, and this rule is what
+      // enforces the auction's core promise: a bidder learns where their price
+      // stands in the market, and never whose price it is standing against.
+      //
+      // Readable by the auctioneer (who runs the auction), an observer (the
+      // buying side, who sees the auctioneer's screen), and the participant
+      // themselves. Never by another bidder — not before the auction, not
+      // during it, and not after results are released.
+      match /identities/{publicKey} {
+        allow get: if isOwner()
+          || (hasClaim() && (claim().role == 'viewer' || claim().publicKey == publicKey));
+        allow list: if isOwner() || (hasClaim() && claim().role == 'viewer');
+        allow create: if isOwner();
+        // Immutable: a rename would otherwise let the auctioneer's screen and a
+        // supplier's own screen disagree about who bid what after the fact.
+        allow update, delete: if false;
       }
 
       // ---- invites/{inviteId} : bearer capability -------------------------

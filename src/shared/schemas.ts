@@ -37,7 +37,9 @@ export const inboundRoles: Record<keyof typeof eventSchemas, readonly Role[]> = 
   addLot: ['owner'],
   renameLot: ['owner'],
   placeBid: ['bidder', 'owner'],
-  cancelBid: ['owner'],
+  // A supplier may withdraw a bid of their own — mistyped bids happen, and
+  // sometimes on purpose. `validateInbound` is what holds them to their own.
+  cancelBid: ['owner', 'bidder'],
   startAuction: ['owner'],
   showResults: ['owner'],
 };

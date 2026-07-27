@@ -1,6 +1,6 @@
-import type { AuctionEvent, InboundEventInput, Role } from './types';
-import { AuctionAggregate, type StoredBid, type StoredUser } from './aggregate';
-import { beatsBest, MAX_BIDDERS, MAX_LOTS } from './rules';
+import type { AuctionEvent, InboundEventInput } from './types';
+import { AuctionAggregate, type Participant, type StoredBid } from './aggregate';
+import { beatsBest, MAX_BIDDERS, MAX_LOTS, participantLabel, totalRunSec } from './rules';
 
 /**
  * Bidirectional validation, ported from `validation.py`.
@@ -18,16 +18,10 @@ export type InboundResult =
 
 const fail = (error: string): InboundResult => ({ ok: false, error });
 
-function countBidders(agg: AuctionAggregate): number {
-  let total = 0;
-  for (const user of agg.users.values()) if (user.role === 'bidder') total += 1;
-  return total;
-}
-
 export function validateInbound(
   agg: AuctionAggregate,
   input: InboundEventInput,
-  actor: StoredUser,
+  actor: Participant,
   now: number,
   seq: number,
 ): InboundResult {
@@ -38,11 +32,23 @@ export function validateInbound(
       return { ok: true, event };
 
     case 'addUser': {
-      if (input.role === 'bidder' && countBidders(agg) >= MAX_BIDDERS) {
+      const index = agg.countRole(input.role);
+      if (input.role === 'bidder' && index >= MAX_BIDDERS) {
         return fail(`An auction can have at most ${MAX_BIDDERS} bidding firms.`);
       }
       // Public keys are sequential, matching the original's `len(self.users)`.
       event.publicKey = String(agg.users.size);
+
+      // The public identity a rival is allowed to see: a nondescript label and
+      // a colour, both fixed here in signup order. The real name and email
+      // never enter the log at all — they go to `auctions/{id}/identities`,
+      // which only the auctioneer, an observer and the participant themselves
+      // can read. That is what keeps a supplier from ever attaching a firm to
+      // a price, before, during or after the auction.
+      event.label = participantLabel(input.role, index);
+      event.colorIndex = index;
+      delete event.name;
+      delete event.email;
       return { ok: true, event };
     }
 
@@ -66,13 +72,22 @@ export function validateInbound(
       const target = agg.bids.find((bid) => bid.seq === input.bidSeq);
       if (!target) return fail('No such bid.');
       if (agg.cancelledBids.has(input.bidSeq)) return fail('That bid is already cancelled.');
+      // A supplier may withdraw a bid they entered in error, but only their
+      // own; the auctioneer may withdraw anyone's, since a mistyped bid the
+      // bidder does not notice can distort the whole board.
+      if (actor.role !== 'owner' && target.bidder !== actor.publicKey) {
+        return fail('You can only remove your own bids.');
+      }
+      // Named so the fold and the security rules can both tell whose bid this
+      // withdraws without following `bidSeq` (see `apply('cancelBid')`).
+      event.bidder = target.bidder;
       return { ok: true, event };
     }
 
     case 'startAuction': {
       if (agg.startTime !== null) return fail('Auction already started!');
       if (agg.lots.size === 0) return fail('Add at least one lot before starting.');
-      event.auctionLength = agg.config.auctionLengthSec;
+      event.auctionLength = totalRunSec(agg.config);
       return { ok: true, event };
     }
 
@@ -87,7 +102,7 @@ export function validateInbound(
 function inboundPlaceBid(
   agg: AuctionAggregate,
   input: Extract<InboundEventInput, { type: 'placeBid' }>,
-  actor: StoredUser,
+  actor: Participant,
   now: number,
   event: AuctionEvent,
 ): InboundResult {
@@ -134,12 +149,14 @@ function inboundPlaceBid(
   event.bidder = bidderKey;
   delete event.onBehalfOfPublicKey;
 
-  // Extended Time: a leading bid inside the threshold pushes the clock back
-  // out to the threshold. Ported from `_inbound_place_bid`, now config-driven.
-  const { lastCallSec, extendedTimeThresholdSec } = agg.config;
-  const remaining = agg.remaining(now);
-  if (remaining > lastCallSec && remaining < extendedTimeThresholdSec) {
-    event.auctionLength = agg.auctionLength + (extendedTimeThresholdSec - remaining);
+  // Extended Time: a leading bid inside the threshold pushes the clock back out
+  // to the threshold. Ported from `_inbound_place_bid`, now config-driven — and
+  // measured on the main clock the bidder is watching, so a 90s threshold means
+  // "under 1:30 showing" rather than 1:30 of total run left.
+  const { extendedTimeThresholdSec } = agg.config;
+  const mainRemaining = agg.mainRemaining(now);
+  if (mainRemaining > 0 && mainRemaining < extendedTimeThresholdSec) {
+    event.auctionLength = agg.auctionLength + (extendedTimeThresholdSec - mainRemaining);
   }
 
   return { ok: true, event };
@@ -152,7 +169,7 @@ function inboundPlaceBid(
 export function filterOutbound(
   agg: AuctionAggregate,
   event: AuctionEvent,
-  viewer: StoredUser,
+  viewer: Participant,
   now: number,
 ): AuctionEvent | null {
   const isOwner = viewer.role === 'owner';
@@ -181,14 +198,16 @@ export function filterOutbound(
     }
 
     case 'addUser': {
+      // Anonymity is structural now: `validateInbound` keeps names and emails
+      // out of the log entirely, so there is normally nothing here to strip.
+      // Logs written before that split still carry them, and a bidder must not
+      // learn a rival's firm by replaying old history either.
       const out = { ...event };
-      if (!isOwner) delete out.email;
-
-      // Bidders compete anonymously: they see their own name and nobody else's.
-      const isSelf = out.publicKey === viewer.publicKey;
-      if (viewer.role === 'bidder' && !isSelf) {
-        out.name = anonymousLabel(out.role as Role, out.publicKey as string);
-        out.anonymised = true;
+      if (out.publicKey !== viewer.publicKey && viewer.role === 'bidder') {
+        delete out.name;
+        delete out.email;
+      } else if (!isOwner) {
+        delete out.email;
       }
       return out;
     }
@@ -196,9 +215,4 @@ export function filterOutbound(
     default:
       return { ...event };
   }
-}
-
-function anonymousLabel(role: Role, publicKey: string): string {
-  const noun = role === 'bidder' ? 'Bidder' : role === 'viewer' ? 'Observer' : 'Organiser';
-  return `${noun} ${publicKey}`;
 }

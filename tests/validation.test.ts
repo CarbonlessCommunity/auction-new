@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { AuctionAggregate } from '../src/shared/aggregate';
+import { eventSchemas, inboundRoles, parseInboundEvent } from '../src/shared/schemas';
 import { filterOutbound } from '../src/shared/validation';
 import { makeAuction, startedAuction, T0 } from './helpers';
 
@@ -240,6 +242,50 @@ describe('cancelling bids', () => {
     expect(agg.activeBids()).toHaveLength(1);
   });
 
+  /**
+   * Suppliers mistype bids — sometimes, the auctioneer reckons, on purpose to
+   * spoil an auction. Both ends of that can undo it: the supplier straight
+   * away, and the auctioneer for the ones nobody notices in time.
+   */
+  it('lets a supplier withdraw a bid of their own', () => {
+    const { agg, submit, alice, lot } = startedAuction();
+
+    submit({ type: 'placeBid', lotId: lot, value: 100 }, alice, T0 + 1);
+    const fatFingered = submit({ type: 'placeBid', lotId: lot, value: 10 }, alice, T0 + 2);
+    if (!fatFingered.ok) throw new Error(fatFingered.error);
+
+    expect(submit({ type: 'cancelBid', bidSeq: fatFingered.event.seq }, alice, T0 + 3).ok).toBe(true);
+    expect(agg.bestBidFor(lot)?.value).toBe(100);
+  });
+
+  it('refuses to let a supplier withdraw a rival\'s bid', () => {
+    const { agg, submit, alice, bob, lot } = startedAuction();
+    const theirs = submit({ type: 'placeBid', lotId: lot, value: 100 }, alice, T0 + 1);
+    if (!theirs.ok) throw new Error(theirs.error);
+
+    const stolen = submit({ type: 'cancelBid', bidSeq: theirs.event.seq }, bob, T0 + 2);
+    expect(stolen.ok).toBe(false);
+    expect(agg.activeBids()).toHaveLength(1);
+  });
+
+  /**
+   * The security rules can only check that a supplier's cancellation names
+   * *themselves* — they cannot follow `bidSeq` to the bid it points at. So a
+   * hand-written cancellation naming yourself but pointing at a rival's bid is
+   * the one thing that could get past them, and the fold refuses it.
+   */
+  it('ignores a forged cancellation that names the wrong bidder', () => {
+    const ctx = startedAuction();
+    const theirs = ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 100 }, ctx.alice, T0 + 1);
+    if (!theirs.ok) throw new Error(theirs.error);
+
+    const forged = { type: 'cancelBid' as const, seq: 99, time: T0 + 2, bidSeq: theirs.event.seq, bidder: ctx.bob.publicKey };
+    const agg = AuctionAggregate.replay('forged', ctx.config, [...ctx.log, forged]);
+
+    expect(agg.cancelledBids.size).toBe(0);
+    expect(agg.bestBidFor(ctx.lot)?.value).toBe(100);
+  });
+
   it('refuses to cancel a bid twice or one that does not exist', () => {
     const { submit, owner, alice, lot } = startedAuction();
     const bid = submit({ type: 'placeBid', lotId: lot, value: 100 }, alice, T0 + 1);
@@ -251,18 +297,96 @@ describe('cancelling bids', () => {
   });
 });
 
+describe('who may control what', () => {
+  /**
+   * The client on the buying side watches and does nothing else: no bidding,
+   * no withdrawing, and none of the auctioneer's tools. The role ACL is the
+   * first gate; `firestore.rules` is the one that cannot be bypassed.
+   */
+  it('gives the watching client no control at all', () => {
+    for (const type of Object.keys(eventSchemas)) {
+      expect(inboundRoles[type as keyof typeof eventSchemas]).not.toContain('viewer');
+    }
+    expect(parseInboundEvent({ type: 'placeBid', lotId: 'lot-0', value: 1 }, 'viewer').ok).toBe(false);
+    expect(parseInboundEvent({ type: 'cancelBid', bidSeq: 0 }, 'viewer').ok).toBe(false);
+  });
+
+  it('lets a supplier bid and withdraw, and nothing else', () => {
+    expect(parseInboundEvent({ type: 'placeBid', lotId: 'lot-0', value: 1 }, 'bidder').ok).toBe(true);
+    expect(parseInboundEvent({ type: 'cancelBid', bidSeq: 0 }, 'bidder').ok).toBe(true);
+    expect(parseInboundEvent({ type: 'showResults' }, 'bidder').ok).toBe(false);
+    expect(parseInboundEvent({ type: 'startAuction' }, 'bidder').ok).toBe(false);
+    expect(parseInboundEvent({ type: 'addUser', name: 'X', role: 'bidder' }, 'bidder').ok).toBe(false);
+  });
+});
+
 describe('participant anonymity', () => {
-  it('hides other participants\' names from bidders only', () => {
+  /**
+   * The core promise to a supplier: they learn where their price sits in the
+   * market and nothing about whose price it sits against — not before the
+   * auction, not during it, not after. That is enforced structurally rather
+   * than by the renderer: names never enter the log at all, so no amount of
+   * reading it (or tampering with the client that folds it) recovers one.
+   */
+  it('keeps real names and emails out of the event log entirely', () => {
+    const ctx = startedAuction();
+
+    for (const event of ctx.log.filter((e) => e.type === 'addUser')) {
+      expect(event.name).toBeUndefined();
+      expect(event.email).toBeUndefined();
+      expect(typeof event.label).toBe('string');
+    }
+
+    const serialised = JSON.stringify(ctx.log);
+    expect(serialised).not.toContain('Alice');
+    expect(serialised).not.toContain('Bob');
+    expect(serialised).not.toContain('Organiser');
+  });
+
+  it('assigns suppliers nondescript labels and colours in signup order', () => {
+    const ctx = makeAuction();
+    ctx.addUser('Organiser', 'owner');
+    const first = ctx.addUser('Alice', 'bidder');
+    ctx.addUser('A watching client', 'viewer');
+    const second = ctx.addUser('Bob', 'bidder');
+    const third = ctx.addUser('Carol', 'bidder');
+
+    // Suppliers run A, B, C in signup order regardless of who else was
+    // invited in between, and each keeps its own palette slot.
+    expect([first.label, second.label, third.label]).toEqual([
+      'Supplier A',
+      'Supplier B',
+      'Supplier C',
+    ]);
+    expect([first.colorIndex, second.colorIndex, third.colorIndex]).toEqual([0, 1, 2]);
+
+    // Folding the log reproduces exactly that, and nothing more.
+    const bidders = [...ctx.agg.users.values()].filter((u) => u.role === 'bidder');
+    expect(bidders.map((u) => u.name)).toEqual(['Supplier A', 'Supplier B', 'Supplier C']);
+  });
+
+  it('gives every participant the same label whoever is looking', () => {
     const ctx = startedAuction();
     const event = ctx.log.find((e) => e.type === 'addUser' && e.publicKey === ctx.bob.publicKey)!;
 
-    const forAlice = filterOutbound(ctx.agg, event, ctx.alice, T0);
-    expect(forAlice?.name).toBe(`Bidder ${ctx.bob.publicKey}`);
+    for (const viewer of [ctx.alice, ctx.bob, ctx.owner]) {
+      expect(filterOutbound(ctx.agg, event, viewer, T0)?.label).toBe(ctx.bob.label);
+    }
+  });
 
-    const forBob = filterOutbound(ctx.agg, event, ctx.bob, T0);
-    expect(forBob?.name).toBe('Bob');
+  it('still strips names from a log written before identities were split out', () => {
+    const ctx = startedAuction();
+    // A legacy addUser event, as the old validator would have appended it.
+    const legacy = { ...ctx.log.find((e) => e.type === 'addUser')!, name: 'Bob', email: 'bob@example.com' };
 
-    const forOwner = filterOutbound(ctx.agg, event, ctx.owner, T0);
-    expect(forOwner?.name).toBe('Bob');
+    const forAlice = filterOutbound(ctx.agg, legacy, ctx.alice, T0);
+    expect(forAlice?.name).toBeUndefined();
+    expect(forAlice?.email).toBeUndefined();
+
+    // And even unfiltered, folding one never puts the name on the board.
+    const agg = AuctionAggregate.replay('legacy', ctx.config, [
+      { type: 'addUser', seq: 0, time: T0, publicKey: '0', role: 'bidder', name: 'Bob' },
+    ]);
+    expect(agg.users.get('0')?.name).toBe('Supplier A');
   });
 });

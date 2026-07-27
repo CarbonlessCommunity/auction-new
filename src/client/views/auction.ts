@@ -1,5 +1,5 @@
 import { Connection } from '../connection';
-import type { AuctionAggregate, StoredLot } from '../../shared/aggregate';
+import type { AuctionAggregate, StoredLot, StoredUser } from '../../shared/aggregate';
 import type { AuctionPhase, BidDirection, Role } from '../../shared/types';
 import { MAX_BIDDERS, MAX_LOTS } from '../../shared/rules';
 import { bidderColor, escapeHtml, formatClock, formatValue, patch, toast } from '../format';
@@ -106,15 +106,23 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       buttons.push(`<button data-act="panel-lot" ${agg.lots.size >= MAX_LOTS ? 'disabled' : ''}>Add contract term</button>`);
     }
     if (!notStarted && !agg.showResultsReleased) {
-      buttons.push(`<button class="primary" data-act="release">Release results</button>`);
+      buttons.push(`<button class="primary" data-act="release">Release results to everyone</button>`);
     }
 
     buttons.push('<button data-act="panel-person">Add participant</button>');
     buttons.push(`<button data-act="panel-people">People (${agg.users.size})</button>`);
-    buttons.push('<button data-act="export-results">Export results</button>');
-    buttons.push('<button data-act="export-bids">Export bids</button>');
+    buttons.push('<button data-act="export-results">Download results (CSV)</button>');
+    buttons.push('<button data-act="export-bids">Download bid log (CSV)</button>');
 
-    el.controls.innerHTML = buttons.join('');
+    // The two were easy to confuse: one changes what other people's screens
+    // show, the other only puts a file on this machine.
+    const hint = agg.showResultsReleased
+      ? 'Results are released — every screen now shows the Last Call bids. The downloads are private files for you, and always include the firm names.'
+      : notStarted
+        ? 'Releasing results is what reveals the Last Call bids on the suppliers’ and client’s screens. Downloading only saves a CSV to this machine.'
+        : 'Nobody sees the Last Call bids until you release results. Downloading a CSV changes nothing on their screens — it just saves a file here.';
+
+    el.controls.innerHTML = `${buttons.join('')}<p class="hint">${hint}</p>`;
   }
 
   function renderPanel(agg: AuctionAggregate): void {
@@ -152,7 +160,10 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
             <button class="primary">Add</button>
           </div>
           <p class="muted" style="font-size:0.85rem;margin:0.6rem 0 0">
-            You will get a private invite link to send them. Suppliers never see each other's names.
+            You will get a private invite link to send them. Each supplier is
+            assigned a colour as you add them, and that colour is all the other
+            suppliers ever see of them — names appear on your screen and the
+            client's, never on a rival's.
           </p>
         </form>`;
       return;
@@ -162,9 +173,16 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       const rows = [...agg.users.values()]
         .map((user) => {
           const link = inviteLinks.get(user.publicKey);
+          const swatch =
+            user.role === 'bidder'
+              ? `<span class="swatch" style="background:${bidderColor(user.colorIndex)}"></span>`
+              : '';
           return `
             <li>
-              <span class="grow">${escapeHtml(user.name)} <span class="role">${roleLabel(user.role)}</span></span>
+              <span class="grow">
+                ${swatch}${escapeHtml(user.name)}
+                <span class="role">${roleLabel(user.role)}</span>
+              </span>
               <button class="link" data-act="invite" data-key="${user.publicKey}">
                 ${link ? 'new link' : 'get link'}
               </button>
@@ -174,7 +192,15 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
         })
         .join('');
 
-      el.panel.innerHTML = `<div class="card panel"><h3>People</h3><ul class="people">${rows}</ul></div>`;
+      el.panel.innerHTML = `
+        <div class="card panel">
+          <h3>People</h3>
+          <ul class="people">${rows}</ul>
+          <p class="hint">
+            A supplier's colour is the only thing the other suppliers see of them.
+            Names appear here, on the client's screen, and in the CSV downloads.
+          </p>
+        </div>`;
       return;
     }
 
@@ -191,12 +217,19 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
             </select>
           </label>
           <div class="grid-2">
-            <label><span>Length (s)</span><input type="number" name="auctionLengthSec" value="${c.auctionLengthSec}" min="10" /></label>
+            <label><span>Bidding clock (s)</span><input type="number" name="auctionLengthSec" value="${c.auctionLengthSec}" min="10" /></label>
             <label><span>Extended time under (s)</span><input type="number" name="extendedTimeThresholdSec" value="${c.extendedTimeThresholdSec}" min="0" /></label>
             <label><span>Last call (s)</span><input type="number" name="lastCallSec" value="${c.lastCallSec}" min="0" /></label>
             <label><span>Last call bidders</span><input type="number" name="lastCallBidders" value="${c.lastCallBidders}" min="0" max="${MAX_BIDDERS}" /></label>
             <label><span>Minimum step</span><input type="number" name="minBidStep" value="${c.minBidStep}" min="0" step="any" /></label>
           </div>
+          <p class="hint">
+            Every number is read off the clock on screen: ${formatClock(c.auctionLengthSec)} of bidding,
+            Extended Time from ${formatClock(c.extendedTimeThresholdSec)} showing, then
+            ${formatClock(c.lastCallSec)} of Last Call on top — ${formatClock(c.auctionLengthSec + c.lastCallSec)} in all.
+            Last Call is blind either way; "last call bidders" only sets how many of a
+            term's leaders may answer in it (0 leaves it open to everyone).
+          </p>
           <button class="primary">Save rules</button>
         </form>`;
     }
@@ -222,12 +255,14 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
         </div>
         <ol>
           <li>You may bid on any or all contract terms, and only bids ${better} than that term's current best are accepted${c.minBidStep > 0 ? `, by at least ${formatValue(c.minBidStep)}` : ''}.</li>
-          <li>You see every rival's price but never their name — only their colour.</li>
-          <li>A leading bid with under ${formatClock(c.extendedTimeThresholdSec - c.lastCallSec)} left resets the clock to that mark — "Extended Time".</li>
-          <li>The final ${formatClock(c.lastCallSec)} is "Last Call"${
+          <li>You see every rival's price, but never who they are — a rival is only ever a
+              colour. That stays true after the auction ends, and their screens tell them
+              no more about you. Your own bids carry your name, on your screen only.</li>
+          <li>A leading bid with under ${formatClock(c.extendedTimeThresholdSec)} on the clock resets it to that mark — "Extended Time".</li>
+          <li>The clock then runs a final ${formatClock(c.lastCallSec)} of "Last Call"${
             c.lastCallBidders > 0 ? `, open only to each term's ${c.lastCallBidders} leading bidders` : ''
-          }: your bids are hidden from other bidders, and theirs from you.</li>
-          <li>Results appear once the auctioneer releases them, and the auctioneer may remove a bid made in error at any time.</li>
+          }: it is blind, so the board shows you your own bids and nothing else until results are released.</li>
+          <li>You can remove a bid of your own if you enter it wrongly, and the auctioneer may remove any bid made in error.</li>
           <li>The best bidder is not guaranteed the business.</li>
         </ol>
       </div>`;
@@ -254,9 +289,18 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
 
   /**
    * One contract term: a ladder of every supplier's own best price, best
-   * first. Suppliers are identified only by their colour on a bidder's screen
-   * — the outbound filter has already replaced rival names by the time we
-   * render — while the auctioneer and the client see who is behind each one.
+   * first — and the one place the three screens genuinely differ.
+   *
+   * On a supplier's screen a rival is only ever a colour: real names were never
+   * in the log they folded and the identity docs are closed to them, so there
+   * is nothing to print. Their own card carries their own name. The auctioneer
+   * and the buying-side client see the same ladder with the firm on every card,
+   * which is the only screen where a price and a firm appear together.
+   *
+   * In Last Call a supplier's board narrows to their own bids alone. Rivals'
+   * bids from inside the window were never sent to them (that part is
+   * enforced); the pre-window prices they had already seen are simply taken off
+   * the board, so the final minute is bid blind on both sides.
    */
   function lotColumn(
     agg: AuctionAggregate,
@@ -264,22 +308,32 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     phase: AuctionPhase,
     yourKey: string,
     bidding: boolean,
-    bidders: Array<{ publicKey: string; name: string }>,
+    bidders: StoredUser[],
   ): string {
-    const ranked = agg.standings(lot.id);
+    const yoursOnly = phase.isInLastCall && canBid() && !agg.showResultsReleased;
+    const ranked = agg.standings(lot.id).filter((bid) => !yoursOnly || bid.bidder === yourKey);
 
     const rows = ranked
       .map((bid, index) => {
         const user = agg.users.get(bid.bidder);
+        const name = who(user, yourKey);
+        // A supplier may withdraw their own mistyped bid; the auctioneer any.
+        const removable = isOwner() || (canBid() && bid.bidder === yourKey && phase.isRunning);
         return `
-          <li class="bid ${index === 0 ? 'lead' : ''} ${bid.bidder === yourKey ? 'ours' : ''}"
-              style="--bidder-color:${bidderColor(bid.bidder)}">
+          <li class="bid ${index === 0 && !yoursOnly ? 'lead' : ''} ${bid.bidder === yourKey ? 'ours' : ''}"
+              style="--bidder-color:${bidderColor(user?.colorIndex ?? 0)}">
             <span class="price">${formatValue(bid.value)}</span>
-            <span class="who">${escapeHtml(user?.name ?? 'Unknown')}</span>
-            ${isOwner() ? `<button class="link" data-act="cancel" data-seq="${bid.seq}">remove</button>` : ''}
+            ${name ? `<span class="who">${escapeHtml(name)}</span>` : ''}
+            ${removable ? `<button class="link" data-act="cancel" data-seq="${bid.seq}">remove</button>` : ''}
           </li>`;
       })
       .join('');
+
+    const blindNote = !phase.isInLastCall || isOwner() || agg.showResultsReleased
+      ? ''
+      : canBid()
+        ? '<p class="locked">Last Call is blind — you can see your own bids only.</p>'
+        : '<p class="locked">Last Call is blind — bids placed now appear when results are released.</p>';
 
     // Last Call hands the term to its leaders; everyone else can only watch.
     const eligible = phase.isInLastCall ? agg.lastCallEligible(lot.id) : null;
@@ -298,7 +352,9 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       isOwner() && phase.isRunning && bidders.length
         ? `<form class="bidform" data-form="behalf" data-lot="${lot.id}">
              <select name="bidder">
-               ${bidders.map((b) => `<option value="${b.publicKey}">${escapeHtml(b.name)}</option>`).join('')}
+               ${bidders
+                 .map((b) => `<option value="${b.publicKey}">${escapeHtml(b.name)}</option>`)
+                 .join('')}
              </select>
              <input name="value" type="number" step="any" min="0" data-k="behalf-${lot.id}" placeholder="Amount" required />
              <button>Bid</button>
@@ -312,6 +368,7 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
           ${isOwner() && agg.startTime === null ? `<button class="link" data-act="rename" data-lot="${lot.id}">rename</button>` : ''}
         </header>
         ${rows ? `<ol class="ladder">${rows}</ol>` : '<p class="empty">(no bids)</p>'}
+        ${blindNote}
         ${yourForm}
         ${onBehalf}
       </section>`;
@@ -334,7 +391,11 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
 
     const phase = agg.phase(connection.now());
     el.name.textContent = agg.name;
-    el.who.textContent = `${connection.you.name} (${roleLabel(connection.you.role)})`;
+    // The mentor's first complaint was that the three screens were
+    // indistinguishable, so each one says what it is and what it shows.
+    el.who.innerHTML = `
+      <span class="me">${escapeHtml(connection.you.name)}</span>
+      <span class="view">${escapeHtml(viewBanner(connection.you.role))}</span>`;
 
     renderClock(agg, phase);
     renderControls(agg, phase);
@@ -352,7 +413,28 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
   }
 
   function roleLabel(role: Role): string {
-    return role === 'owner' ? 'auctioneer' : role === 'bidder' ? 'supplier' : 'viewer';
+    return role === 'owner' ? 'auctioneer' : role === 'bidder' ? 'supplier' : 'client';
+  }
+
+  /**
+   * How a participant is named on a ladder row — empty for a card that should
+   * carry no name at all. A supplier sees their own firm on their own cards and
+   * nothing but colour on a rival's; the auctioneer and the client see every
+   * firm. (`user.name` is only ever a real name for identities this viewer was
+   * allowed to read, so this is a presentation choice on top of an access one,
+   * not the thing keeping rivals anonymous.)
+   */
+  function who(user: StoredUser | undefined, yourKey: string): string {
+    if (!user) return '';
+    if (user.publicKey === yourKey) return `${user.name} (you)`;
+    return canBid() ? '' : user.name;
+  }
+
+  /** The one line that tells someone which of the three screens they are on. */
+  function viewBanner(role: Role): string {
+    if (role === 'owner') return 'Auctioneer view — you see every firm, including Last Call bids';
+    if (role === 'viewer') return 'Client view — you see every firm; Last Call bids appear when released';
+    return 'Supplier view — rivals are colours only, and never named';
   }
 
   function keyOf(phase: AuctionPhase, agg: AuctionAggregate): string {
@@ -406,12 +488,14 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     }
 
     if (act === 'release') {
-      if (!confirm('Release results to everyone? Last Call bids become visible.')) return;
+      if (!confirm('Release results to everyone? Last Call bids become visible on every screen.')) return;
       await submit({ type: 'showResults' });
       return;
     }
 
     if (act === 'cancel') {
+      const mine = !isOwner();
+      if (mine && !confirm('Remove this bid? Your next-best bid on this term takes its place.')) return;
       await submit({ type: 'cancelBid', bidSeq: Number(target.dataset.seq) });
       return;
     }

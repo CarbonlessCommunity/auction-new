@@ -48,7 +48,7 @@ export function renderCreate(root: HTMLElement): void {
 
           <div class="grid-2">
             <label>
-              <span>Length (seconds)</span>
+              <span>Bidding clock (seconds)</span>
               <input name="auctionLengthSec" type="number" min="10" value="${DEFAULT_CONFIG.auctionLengthSec}" />
             </label>
             <label>
@@ -69,10 +69,12 @@ export function renderCreate(root: HTMLElement): void {
             </label>
           </div>
           <p class="muted" style="font-size:0.8rem;margin:0">
-            The length spans the whole run: the bidding clock plus Last Call. A
-            leading bid placed with less than the extended-time threshold left
-            pushes the clock back out to it. Last Call itself is blind, and open
-            only to each term's leading bidders.
+            Every number is read off the clock on screen. The bidding clock counts
+            down to zero, then Last Call runs for its own window on top — so the
+            defaults are 5:00 of bidding followed by 1:00 of Last Call. Extended
+            time under 90 means a leading bid with the clock showing less than
+            1:30 pushes it back out to 1:30. Last Call is blind, and open only to
+            each term's leading bidders.
           </p>
         </details>
 

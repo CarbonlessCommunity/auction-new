@@ -17,15 +17,18 @@ export type BidDirection = 'reverse' | 'forward';
 
 export interface AuctionConfig {
   bidDirection: BidDirection;
-  /** Base auction duration, in seconds, before any extensions. */
+  /**
+   * The main bidding clock, in seconds, before any extensions. Last Call runs
+   * *after* it reaches zero, so the whole event lasts this plus `lastCallSec`.
+   */
   auctionLengthSec: number;
   /**
-   * When a leading bid arrives with remaining time inside
-   * (lastCallSec, extendedTimeThresholdSec), the clock resets so remaining
-   * time becomes exactly extendedTimeThresholdSec again ("Extended Time").
+   * A mark on that same main clock: a leading bid arriving with less than this
+   * showing pushes the clock back out to it ("Extended Time"). 90 means the
+   * mark sits at 1:30 on the clock, which is what participants see.
    */
   extendedTimeThresholdSec: number;
-  /** Length of the blind bidding window right after the clock hits zero. */
+  /** Length of the blind bidding window right after the main clock hits zero. */
   lastCallSec: number;
   /**
    * How many leading suppliers may still bid on a lot once Last Call opens.
@@ -113,6 +116,11 @@ export type InboundEventInput =
 export interface UserView {
   publicKey: string;
   role: Role;
+  /** Nondescript public identity, e.g. "Supplier C". Safe to show anyone. */
+  label: string;
+  /** Palette slot, assigned in signup order within the role. */
+  colorIndex: number;
+  /** Real name — only ever populated for identities this viewer may see. */
   name: string;
 }
 

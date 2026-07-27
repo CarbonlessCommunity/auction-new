@@ -12,8 +12,9 @@ import {
 } from 'firebase/firestore';
 import { onAuthStateChanged, signInAnonymously, type User } from 'firebase/auth';
 import { auth, db } from './firebase';
-import { AuctionAggregate, type StoredUser } from '../shared/aggregate';
+import { AuctionAggregate, type Participant } from '../shared/aggregate';
 import { configSchema } from '../shared/config';
+import { totalRunSec } from '../shared/rules';
 import { parseInboundEvent } from '../shared/schemas';
 import { filterOutbound, validateInbound } from '../shared/validation';
 import type { AddUserInput, AuctionConfig, AuctionEvent, AuctionMeta, InboundEventInput, Role, UserView } from '../shared/types';
@@ -42,20 +43,40 @@ interface AuctionDocData {
   showResults: boolean;
 }
 
+/**
+ * `auctions/{id}/users/{publicKey}` — the claimable slot. Deliberately holds
+ * *no* identifying data: any signed-in client can read it (the claim handshake
+ * needs to, before it has a claim of its own), so a supplier's firm cannot live
+ * here. Only the label and colour a rival is allowed to see.
+ */
 interface UserDocData {
   publicKey: string;
   role: Role;
-  name: string;
-  email?: string;
+  label: string;
+  colorIndex: number;
   /** Firebase anon-auth uid bound to this slot, or null until an invite is claimed. */
   claimUid: string | null;
   claimInviteId: string | null;
+}
+
+/**
+ * `auctions/{id}/identities/{publicKey}` — the only place a real name or email
+ * exists. `firestore.rules` scopes it to the auctioneer, observers, and the
+ * participant themselves, so a supplier cannot read one even by talking to
+ * Firestore directly. This, not the render-time filter, is what actually keeps
+ * bidders from learning who they are bidding against.
+ */
+interface IdentityDocData {
+  name: string;
+  email?: string;
 }
 
 const auctionRef = (id: string) => doc(db, 'auctions', id);
 const eventsCol = (id: string) => collection(db, 'auctions', id, 'events');
 const eventRef = (id: string, seq: number) => doc(db, 'auctions', id, 'events', String(seq).padStart(10, '0'));
 const userRef = (id: string, publicKey: string) => doc(db, 'auctions', id, 'users', publicKey);
+const identitiesCol = (id: string) => collection(db, 'auctions', id, 'identities');
+const identityRef = (id: string, publicKey: string) => doc(db, 'auctions', id, 'identities', publicKey);
 const inviteRef = (id: string, inviteId: string) => doc(db, 'auctions', id, 'invites', inviteId);
 /**
  * `auctions/{id}/claims/{uid}` mirrors "which slot does this Firebase Auth uid
@@ -138,12 +159,12 @@ export async function createAuction(input: CreateAuctionInput): Promise<ApiResul
       ownerUid: user.uid,
       nextSeq: 0,
       startedAt: null,
-      auctionLength: input.config.auctionLengthSec,
+      auctionLength: totalRunSec(input.config),
       showResults: false,
       createdAt: serverTimestamp(),
     });
 
-    const system: StoredUser = { publicKey: '__system__', role: 'owner', name: 'System' };
+    const system: Participant = { publicKey: '__system__', role: 'owner' };
     const agg = new AuctionAggregate(id, input.config);
 
     // Two sequential transactions, not one: the events rule's `seq ==
@@ -176,10 +197,14 @@ export async function createAuction(input: CreateAuctionInput): Promise<ApiResul
       tx.set(userRef(id, ownerKey), {
         publicKey: ownerKey,
         role: 'owner',
-        name: input.ownerName,
-        ...(input.email ? { email: input.email } : {}),
+        label: owner.event.label as string,
+        colorIndex: owner.event.colorIndex as number,
         claimUid: user.uid,
         claimInviteId: null,
+      });
+      tx.set(identityRef(id, ownerKey), {
+        name: input.ownerName,
+        ...(input.email ? { email: input.email } : {}),
       });
       tx.set(claimRef(id, user.uid), { publicKey: ownerKey, role: 'owner' });
     });
@@ -226,9 +251,16 @@ export class Connection {
   private auctionData: AuctionDocData | null = null;
   /** The log exactly as stored, before this viewer's outbound filter. */
   private rawEvents: AuctionEvent[] = [];
+  /**
+   * publicKey → real name, for the identities this viewer is allowed to read.
+   * A supplier only ever holds their own entry; the auctioneer and observers
+   * hold the whole roster. Everyone else stays "Supplier B".
+   */
+  private identities = new Map<string, string>();
   private listeners = new Set<() => void>();
   private unsubAuction: (() => void) | null = null;
   private unsubEvents: (() => void) | null = null;
+  private unsubIdentities: (() => void) | null = null;
 
   constructor(auctionId: string) {
     this.auctionId = auctionId;
@@ -262,6 +294,12 @@ export class Connection {
   disconnect(): void {
     this.unsubAuction?.();
     this.unsubEvents?.();
+    this.unsubIdentities?.();
+  }
+
+  /** True when this viewer is entitled to see real names, not just labels. */
+  private seesIdentities(): boolean {
+    return this.you?.role === 'owner' || this.you?.role === 'viewer';
   }
 
   private async init(): Promise<void> {
@@ -281,6 +319,7 @@ export class Connection {
       return;
     }
     this.you = you;
+    this.identities.set(you.publicKey, you.name);
 
     const auctionSnap = await getDoc(auctionRef(this.auctionId));
     if (!auctionSnap.exists()) {
@@ -319,6 +358,18 @@ export class Connection {
         this.emit();
       },
     );
+
+    // Only the auctioneer and observers may enumerate identities — the rules
+    // refuse the query outright for a supplier, so we do not even attempt it.
+    if (this.seesIdentities()) {
+      this.unsubIdentities = onSnapshot(identitiesCol(this.auctionId), (snap) => {
+        for (const identity of snap.docs) {
+          this.identities.set(identity.id, (identity.data() as IdentityDocData).name);
+        }
+        this.refold();
+        this.emit();
+      });
+    }
   }
 
   /**
@@ -339,7 +390,7 @@ export class Connection {
     if (!config || !this.you) return;
 
     const truth = AuctionAggregate.replay(this.auctionId, config, this.rawEvents);
-    const viewer: StoredUser = { publicKey: this.you.publicKey, role: this.you.role, name: this.you.name };
+    const viewer: Participant = { publicKey: this.you.publicKey, role: this.you.role };
     const now = this.now();
 
     const visible: AuctionEvent[] = [];
@@ -348,7 +399,12 @@ export class Connection {
       if (filtered) visible.push(filtered);
     }
 
-    this.agg = AuctionAggregate.replay(this.auctionId, config, visible);
+    const agg = AuctionAggregate.replay(this.auctionId, config, visible);
+    // The fold only ever produces labels. Real names come from the identity
+    // docs Firestore actually let this viewer read, so a supplier's board can
+    // never name a rival however the client is tampered with.
+    for (const [publicKey, name] of this.identities) agg.revealName(publicKey, name);
+    this.agg = agg;
   }
 
   /**
@@ -382,7 +438,13 @@ export class Connection {
 
     const userSnap = await getDoc(userRef(this.auctionId, publicKey));
     if (!userSnap.exists()) return null;
-    return { publicKey, role, name: (userSnap.data() as UserDocData).name };
+    const { label, colorIndex } = userSnap.data() as UserDocData;
+
+    // Your own identity doc — the one real name a supplier is allowed to read.
+    const identitySnap = await getDoc(identityRef(this.auctionId, publicKey));
+    const name = identitySnap.exists() ? (identitySnap.data() as IdentityDocData).name : label;
+
+    return { publicKey, role, label, colorIndex: colorIndex ?? 0, name };
   }
 
   /**
@@ -397,9 +459,16 @@ export class Connection {
     const parsed = parseInboundEvent(input, this.you.role);
     if (!parsed.ok) return { ok: false, error: parsed.error };
 
-    const actor: StoredUser = { publicKey: this.you.publicKey, role: this.you.role, name: this.you.name };
+    const actor: Participant = { publicKey: this.you.publicKey, role: this.you.role };
     const validated = validateInbound(this.agg, parsed.input, actor, this.now(), 0);
     if (!validated.ok) return { ok: false, error: validated.error };
+
+    // Carried alongside the event, never inside it: `validateInbound` strips
+    // the name so it can only reach the access-controlled identities doc.
+    const identity =
+      parsed.input.type === 'addUser'
+        ? { name: parsed.input.name, email: parsed.input.email }
+        : null;
 
     const draft = validated.event;
     let inviteUrlOut: string | undefined;
@@ -420,10 +489,16 @@ export class Connection {
           tx.set(userRef(this.auctionId, publicKey), {
             publicKey,
             role: event.role as Role,
-            name: event.name as string,
-            ...(event.email ? { email: event.email as string } : {}),
+            label: event.label as string,
+            colorIndex: event.colorIndex as number,
             claimUid: null,
             claimInviteId: null,
+          });
+          // The name is stripped off the event by `validateInbound` and lands
+          // here instead, behind the identities rule.
+          tx.set(identityRef(this.auctionId, publicKey), {
+            name: identity!.name,
+            ...(identity!.email ? { email: identity!.email } : {}),
           });
           const inviteId = randomId();
           tx.set(inviteRef(this.auctionId, inviteId), { publicKey });
@@ -464,7 +539,7 @@ export class Connection {
     try {
       await updateDoc(auctionRef(this.auctionId), {
         config: parsed.data,
-        auctionLength: parsed.data.auctionLengthSec,
+        auctionLength: totalRunSec(parsed.data),
       });
       return { ok: true, config: parsed.data };
     } catch (err) {

@@ -53,6 +53,30 @@ describe('the default house clock', () => {
     expect(agg.phase(T0 + 300).isInLastCall).toBe(true);
     expect(agg.phase(T0 + 300).remainingSec).toBe(60);
   });
+
+  /**
+   * Every rule is read off the clock on screen, which is what an auctioneer
+   * setting them is looking at. The threshold used to be measured against the
+   * whole run, so a threshold of 90 put the Extended Time mark at 0:30 — the
+   * clock said one thing and the setting meant another.
+   */
+  it('puts the Extended Time mark where the clock says, whatever the rules are set to', () => {
+    const { agg, config } = startedAuction({ auctionLengthSec: 90, extendedTimeThresholdSec: 90 });
+    const displayed = (offset: number) => agg.phase(T0 + offset).remainingSec - config.lastCallSec;
+
+    expect(displayed(0)).toBe(90);
+    // The mark is the whole clock here, so Extended Time is live from the off.
+    expect(agg.phase(T0 + 1).isInExtendedTime).toBe(true);
+    expect(agg.phase(T0 + 95).isInLastCall).toBe(true);
+    expect(agg.phase(T0 + 160).isCompleted).toBe(true);
+  });
+
+  it('counts Last Call on top of the bidding clock, not out of it', () => {
+    const { agg } = startedAuction({ auctionLengthSec: 120, lastCallSec: 30 });
+    expect(agg.auctionLength).toBe(150);
+    expect(agg.phase(T0 + 119).isInLastCall).toBe(false);
+    expect(agg.phase(T0 + 121).isInLastCall).toBe(true);
+  });
 });
 
 describe('limits', () => {
@@ -112,12 +136,19 @@ describe('results', () => {
     expect(results).toHaveLength(2);
 
     expect(results[0].lot.name).toBe('12 Months');
-    expect(results[0].winner?.name).toBe('Bob');
+    // Folding alone yields labels — real names are not in the log to be found.
+    expect(results[0].winner?.label).toBe(ctx.bob.label);
+    expect(results[0].winner?.name).toBe(ctx.bob.label);
     expect(results[0].bid?.value).toBe(80);
     expect(results[0].bidCount).toBe(2);
 
-    expect(results[1].winner?.name).toBe('Alice');
+    expect(results[1].winner?.label).toBe(ctx.alice.label);
     expect(results[1].bidCount).toBe(1);
+
+    // The auctioneer's client overlays the identity docs it was allowed to
+    // read, which is the only route by which a name reaches a result row.
+    ctx.agg.revealName(ctx.bob.publicKey, 'Bob');
+    expect(ctx.agg.results()[0].winner?.name).toBe('Bob');
   });
 
   it('reports no winner for a lot nobody bid on', () => {
@@ -127,11 +158,14 @@ describe('results', () => {
 });
 
 describe('config', () => {
-  it('rejects a last call longer than the extended-time threshold', () => {
-    expect(() => parseConfig({ lastCallSec: 200, extendedTimeThresholdSec: 100 })).toThrow();
+  it('rejects an Extended Time mark that falls off the end of the clock', () => {
+    expect(() => parseConfig({ auctionLengthSec: 60, extendedTimeThresholdSec: 120, lastCallSec: 30 })).toThrow();
   });
 
-  it('rejects a threshold longer than the auction itself', () => {
-    expect(() => parseConfig({ auctionLengthSec: 60, extendedTimeThresholdSec: 120, lastCallSec: 30 })).toThrow();
+  // Last Call runs after the clock reaches zero, so its length is independent
+  // of where the Extended Time mark sits — a long Last Call is legal.
+  it('allows a Last Call longer than the Extended Time mark', () => {
+    const config = parseConfig({ auctionLengthSec: 300, extendedTimeThresholdSec: 30, lastCallSec: 120 });
+    expect(config.lastCallSec).toBe(120);
   });
 });

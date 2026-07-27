@@ -1,11 +1,28 @@
 import type { AuctionConfig, AuctionEvent, AuctionPhase, Role } from './types';
-import { beatsBest } from './rules';
+import { beatsBest, participantLabel, totalRunSec } from './rules';
 
-export interface StoredUser {
+/**
+ * The minimum needed to answer "who is acting / who is looking" — all the
+ * inbound and outbound rules ever need. Deliberately carries no name: nothing
+ * about validation or visibility may depend on a participant's identity.
+ */
+export interface Participant {
   publicKey: string;
   role: Role;
+}
+
+export interface StoredUser extends Participant {
+  /** Nondescript public identity ("Supplier B"), assigned at signup. */
+  label: string;
+  /** Palette slot, assigned in signup order within the role. */
+  colorIndex: number;
+  /**
+   * What the *current viewer* may call this participant. Defaults to `label`;
+   * the connection overlays a real name only for the identities this viewer is
+   * entitled to read (the auctioneer, an observer, or yourself). Real names are
+   * never in the event log, so folding alone can never reveal one.
+   */
   name: string;
-  email?: string;
 }
 
 export interface StoredLot {
@@ -42,13 +59,14 @@ export class AuctionAggregate {
   bids: StoredBid[] = [];
   cancelledBids = new Set<number>();
   startTime: number | null = null;
+  /** The whole run in seconds — main clock plus Last Call, extensions included. */
   auctionLength: number;
   showResultsReleased = false;
 
   constructor(id: string, config: AuctionConfig) {
     this.id = id;
     this.config = config;
-    this.auctionLength = config.auctionLengthSec;
+    this.auctionLength = totalRunSec(config);
   }
 
   static replay(id: string, config: AuctionConfig, events: AuctionEvent[]): AuctionAggregate {
@@ -65,13 +83,19 @@ export class AuctionAggregate {
         break;
 
       case 'addUser': {
-        const user: StoredUser = {
+        const role = event.role as Role;
+        // Logs written before identities were split out carry the real name and
+        // no label; derive one rather than replaying a name into the board.
+        const index = this.countRole(role);
+        const label = typeof event.label === 'string' ? event.label : participantLabel(role, index);
+        const colorIndex = typeof event.colorIndex === 'number' ? event.colorIndex : index;
+        this.users.set(event.publicKey as string, {
           publicKey: event.publicKey as string,
-          role: event.role as Role,
-          name: event.name as string,
-        };
-        if (typeof event.email === 'string') user.email = event.email;
-        this.users.set(user.publicKey, user);
+          role,
+          label,
+          colorIndex,
+          name: label,
+        });
         break;
       }
 
@@ -102,9 +126,20 @@ export class AuctionAggregate {
         if (typeof event.auctionLength === 'number') this.auctionLength = event.auctionLength;
         break;
 
-      case 'cancelBid':
-        this.cancelledBids.add(event.bidSeq as number);
+      case 'cancelBid': {
+        // A supplier may withdraw a bid of their own, so a cancellation now
+        // names the bid's owner. Security rules can only check that a
+        // non-owner's cancellation names *themselves* — they cannot follow
+        // `bidSeq` to the bid it points at — so the fold does the other half:
+        // a cancellation whose named owner is not the target bid's actual
+        // bidder is ignored on every screen, which leaves a forged one
+        // affecting nothing.
+        const seq = event.bidSeq as number;
+        const target = this.bids.find((bid) => bid.seq === seq);
+        if (target && typeof event.bidder === 'string' && target.bidder !== event.bidder) break;
+        this.cancelledBids.add(seq);
         break;
+      }
 
       case 'startAuction':
         this.startTime = event.time;
@@ -117,6 +152,23 @@ export class AuctionAggregate {
     }
   }
 
+  /** How many participants of `role` are already on the roster. */
+  countRole(role: Role): number {
+    let total = 0;
+    for (const user of this.users.values()) if (user.role === role) total += 1;
+    return total;
+  }
+
+  /**
+   * Attaches a real name to a participant, for the identities this viewer was
+   * allowed to fetch. Everyone else keeps their label, which is all the fold
+   * ever produced.
+   */
+  revealName(publicKey: string, name: string): void {
+    const user = this.users.get(publicKey);
+    if (user) user.name = name;
+  }
+
   // --- clock -------------------------------------------------------------
 
   get endTime(): number | null {
@@ -126,6 +178,16 @@ export class AuctionAggregate {
   remaining(now: number): number {
     if (this.startTime === null) return this.auctionLength;
     return this.startTime + this.auctionLength - now;
+  }
+
+  /**
+   * Seconds left on the *main* clock — the one every participant is watching,
+   * which reaches zero as Last Call opens. `extendedTimeThresholdSec` is a mark
+   * on this clock, not on the total run: with a 90s threshold, Extended Time
+   * begins when the clock reads 1:30. Goes negative inside Last Call.
+   */
+  mainRemaining(now: number): number {
+    return this.remaining(now) - this.config.lastCallSec;
   }
 
   /**
@@ -158,7 +220,7 @@ export class AuctionAggregate {
     return {
       isRunning,
       isInLastCall: isRunning && remaining <= lastCallSec,
-      isInExtendedTime: isRunning && remaining <= extendedTimeThresholdSec && remaining > lastCallSec,
+      isInExtendedTime: isRunning && remaining > lastCallSec && remaining - lastCallSec <= extendedTimeThresholdSec,
       isCompleted: started && remaining <= 0,
       startTime: this.startTime,
       auctionLength: this.auctionLength,
@@ -226,7 +288,7 @@ export class AuctionAggregate {
   }
 
   /** True when `viewer` is not allowed to see `bid` (blind Last Call rule). */
-  isBidHiddenFrom(bid: StoredBid, viewer: StoredUser, now: number): boolean {
+  isBidHiddenFrom(bid: StoredBid, viewer: Participant, now: number): boolean {
     if (viewer.role === 'owner') return false;
     if (bid.bidder === viewer.publicKey) return false;
     if (!this.isBlindWindow(now)) return false;
@@ -242,7 +304,7 @@ export class AuctionAggregate {
    * validated against this rather than the true best, so a bidder can never
    * infer a rival's hidden Last Call bid from a rejection.
    */
-  visibleBestFor(lotId: string, viewer: StoredUser, now: number): StoredBid | null {
+  visibleBestFor(lotId: string, viewer: Participant, now: number): StoredBid | null {
     let best: StoredBid | null = null;
     for (const bid of this.bidsForLot(lotId)) {
       if (this.isBidHiddenFrom(bid, viewer, now)) continue;

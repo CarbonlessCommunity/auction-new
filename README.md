@@ -27,8 +27,9 @@ one in a private window and you can drive both sides of a live auction on one
 machine.
 
 Then: **Add contract term** → **Start auction** → place bids as the suppliers →
-watch the clock cross into Extended Time and Last Call → **Release results** →
-**Export results**.
+watch the clock cross into Extended Time and Last Call → **Release results to
+everyone** (which reveals the Last Call bids on every screen) → **Download
+results** (which only saves a CSV here).
 
 `npm run dev` talks to the live Firebase project. To work entirely offline,
 start the emulator in one terminal and point the client at it in another:
@@ -84,11 +85,31 @@ Appends are transactional: `submit()` reads `nextSeq`, writes the event at that
 seq, and bumps the counter in one commit, so two simultaneous bids can never
 share a sequence number or be folded in different orders on different screens.
 
-### Identity
+### Three screens
 
 There are three roles — `owner` (the auctioneer), `bidder` (a supplier), and
-`viewer` (a client watching) — and the UI renames itself per role rather than
-showing internal vocabulary.
+`viewer` (the client, watching) — and they are meant to look different. Each
+screen says which one it is in the top-right corner.
+
+| | Sees rival firms' names | Sees Last Call bids | Can do |
+| --- | --- | --- | --- |
+| **Auctioneer** | yes | yes, live | everything: run the clock, bid on a supplier's behalf, withdraw any bid, release results |
+| **Client** | yes | only once results are released | nothing at all — no bidding, no withdrawing, no controls |
+| **Supplier** | **never** — a rival is a colour | only their own | bid, and withdraw a bid of their own |
+
+A supplier's own cards carry their own firm name, so they can find themselves on
+the board; every other card is bare colour and a price. In Last Call a
+supplier's board narrows to their own bids alone, so the final window is bid
+blind from both directions.
+
+Withdrawal is deliberately available to both ends: suppliers mistype bids, and
+sometimes enter a wrong one on purpose to spoil an auction. A supplier can take
+back only their own bid; the auctioneer can take back anyone's, for the mistakes
+that go unnoticed long enough to distort the board.
+
+### Identity
+
+The UI renames each role rather than showing internal vocabulary.
 
 The auctioneer creates a slot per participant and gets a link carrying an invite
 id. The first browser to open that link binds its anonymous uid to the slot,
@@ -96,34 +117,72 @@ write-once; after that the link is spent. A `claims/{uid}` document mirrors the
 binding so the security rules can resolve "who is this uid" with a single read,
 since rules cannot run queries.
 
+### Anonymity
+
+**A supplier never learns who the other suppliers are — not before the auction,
+not during it, and not after results are released.** What they take away is
+market pricing: where their number sits against the field. Whose number it sits
+against is not theirs to know, because a supplier who can attach a firm to a
+price walks in with a view of what that firm charges.
+
+So each supplier is assigned a colour when the auctioneer signs them up, and on
+a rival's screen that colour is the *whole* of their identity — no name, no
+label, nothing to attach a firm to. (They also carry a nondescript label,
+`Supplier A`, `Supplier B`, … in signup order, but it never appears on a
+bidder-facing screen; it exists so the CSV downloads have a stable anonymous
+handle the auctioneer can hand to the client.)
+
+This is structural, not a render-time filter:
+
+- `validateInbound` strips the name and email off an `addUser` event and puts
+  the label and colour on instead, so **real names are never in the event log**.
+  The log is world-readable to anyone signed in; there is simply nothing in it
+  to read.
+- `auctions/{id}/users/{publicKey}` — readable by any signed-in client, because
+  the invite handshake needs it — carries only role, label and colour.
+- Names and emails live in `auctions/{id}/identities/{publicKey}`, and
+  `firestore.rules` scopes that collection to the auctioneer, observers on the
+  buying side, and the participant themselves. A supplier reading Firestore by
+  hand gets exactly as far as one using the UI.
+
+The auctioneer's screen is the only one where a price and a firm appear
+together; the client's shows the same. Both CSV exports carry the anonymous
+label alongside the name so the two views can be reconciled afterwards.
+`npm run test:rules` asserts each of the reads above, in both directions.
+
 ### The rules
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `bidDirection` | `reverse` | `reverse` = lowest bid leads; `forward` = highest leads |
-| `auctionLengthSec` | 360 | How long the clock runs, Last Call included |
-| `extendedTimeThresholdSec` | 150 | A leading bid inside this window pushes the clock back out to it |
+| `auctionLengthSec` | 300 | The main bidding clock. Last Call runs *after* it, on top |
+| `extendedTimeThresholdSec` | 90 | A mark on that clock: a leading bid under it pushes the clock back out to it |
 | `lastCallSec` | 60 | The final blind window |
 | `lastCallBidders` | 2 | How many leaders per term may bid in that window |
 | `minBidStep` | 0 | How far a bid must beat the leader by |
 
-The defaults are the energy-auction house rules: a 5:00 clock counting into a
-60-second Last Call, with the Extended Time mark at 1:30. The auctioneer can
-change all of them before starting; once the auction is running they are frozen,
-by the rules as well as the UI. Up to 12 suppliers and 5 contract terms.
+**Every number is read off the clock on screen.** 300 + 90 + 60 means five
+minutes of bidding, the Extended Time mark at 1:30 showing, then a minute of
+Last Call — 6:00 end to end. (These used to be measured against the whole run
+including Last Call, so a threshold of 90 put the mark at 0:30 and the setting
+disagreed with the clock beside it.) The auctioneer can change all of them
+before starting; once the auction is running they are frozen, by the rules as
+well as the UI. Up to 12 suppliers and 5 contract terms.
 
 **Terms are ranked independently but share one clock.** One board, one countdown,
 a separate leader per term.
 
-**Extended Time.** A new leading bid with, say, 100s left on a 150s threshold
-pushes the clock back out to 150s. The recomputed length is written onto the bid
+**Extended Time.** A new leading bid with 0:40 showing against a 90s threshold
+pushes the clock back out to 1:30. The recomputed length is written onto the bid
 event itself, so replaying the log reproduces the clock exactly rather than
 depending on when the replay happens.
 
-**Last Call.** In the final window, only each term's leading suppliers may bid,
-and bids placed by *other* people are hidden — you see your own, and the
-auctioneer sees everything. Bids placed before the window stay on the board. When
-the auctioneer releases results, everything becomes visible at once.
+**Last Call.** In the final window, only each term's leading suppliers may bid
+(2 by default; the auctioneer can set any number, and 0 leaves it open to
+everyone). It is blind either way: a supplier's board narrows to their own bids
+for the duration, the client's board freezes at the standings that stood when
+the window opened, and only the auctioneer watches it live. When the auctioneer
+releases results, everything becomes visible at once.
 
 Inbound bids are validated against **what the bidder can actually see**, not the
 true leader. That matters: if improvement were enforced against a hidden rival
@@ -146,8 +205,11 @@ bypass. The rules enforce what a client can *prove* from its own uid and documen
 reads:
 
 - only the real owner can issue admin events;
+- a supplier cannot read another supplier's name or email by any route;
 - a supplier can bid only as itself, and cannot forge the `placedBy` marker that
   denotes an auctioneer bidding on someone's behalf;
+- a supplier can withdraw only their own bid, and the watching client can write
+  nothing at all;
 - events are append-only and gapless — no overwrite, no delete, no seq gaps;
 - a supplier's paired clock bump is bounded, so it can neither end the auction
   early nor stall it;
@@ -157,20 +219,23 @@ What they cannot enforce, and what is therefore **cosmetic rather than secret**:
 
 - **Blind Last Call.** Rules cannot filter documents per reader, so a technical
   participant can read the event collection directly and see hidden bids. The
-  client hides them at render time only.
-- **Anonymity.** Participant names are readable by anyone signed in.
+  client hides them at render time only. (Taking a supplier's *pre*-Last-Call
+  view off their board is presentation by nature — those prices were public
+  while the main clock ran, and they had already seen them.)
 - **Bid arithmetic.** Beats-current-best, Extended Time and `minBidStep` are
   client-enforced. A hand-crafted write can place an illegal bid — visibly, in
   the append-only log, but it will land.
 
-Closing those three needs a trusted writer: a Cloud Function (Blaze plan) taking
+Anonymity used to be on that list and no longer is — see below.
+
+Closing the remaining two needs a trusted writer: a Cloud Function (Blaze plan) taking
 bids and running `validateInbound` server-side, with clients denied direct write
 access to `events`. The shared code is already structured for it — `validation.ts`
 has no browser dependencies. Until then, treat the auction as **auditable rather
 than sealed**, which is fine among identified counterparties and not fine against
 a motivated adversary.
 
-`npm run test:rules` asserts each guarantee above, and documents the three gaps
+`npm run test:rules` asserts each guarantee above, and documents the two gaps
 as explicit tests so a future change that closes one is noticed.
 
 ## What changed from the original

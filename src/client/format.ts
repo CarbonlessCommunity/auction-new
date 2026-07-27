@@ -4,9 +4,14 @@ export const BIDDER_COLORS = [
   '#fccde5', '#bc80bd', '#ccebc5', '#ffed6f', '#d9d9d9', '#ffffb3',
 ];
 
-export function bidderColor(publicKey: string): string {
-  const index = Number(publicKey);
-  return BIDDER_COLORS[(Number.isFinite(index) ? index : 0) % BIDDER_COLORS.length];
+/**
+ * A supplier's colour, from the palette slot they were handed when the
+ * auctioneer signed them up. Colour and label ("Supplier C") are the whole of
+ * a rival's public identity, so both are assigned once and never move.
+ */
+export function bidderColor(colorIndex: number): string {
+  const index = Number.isFinite(colorIndex) ? Math.max(0, Math.trunc(colorIndex)) : 0;
+  return BIDDER_COLORS[index % BIDDER_COLORS.length];
 }
 
 /** M:SS, clamped at zero. */

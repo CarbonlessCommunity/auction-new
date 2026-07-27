@@ -26,26 +26,34 @@ const AUCTION = 'a1';
 const OWNER_UID = 'uid-owner';
 const ALICE_UID = 'uid-alice';
 const BOB_UID = 'uid-bob';
+const DAVE_UID = 'uid-dave'; // an observer on the buying side
 const STRANGER_UID = 'uid-stranger';
 
 const ALICE_KEY = 'pk-alice';
 const BOB_KEY = 'pk-bob';
 const CAROL_KEY = 'pk-carol'; // invited, never claimed
+const DAVE_KEY = 'pk-dave';
 const OWNER_KEY = 'pk-owner';
 const LOT = 'lot-0';
 
 /** Mirrors DEFAULT_CONFIG. The auctionLength bound in the rules is derived from these. */
 const CONFIG = {
   bidDirection: 'reverse',
-  auctionLengthSec: 360,
-  extendedTimeThresholdSec: 150,
+  auctionLengthSec: 300,
+  extendedTimeThresholdSec: 90,
   lastCallSec: 60,
   lastCallBidders: 2,
   minBidStep: 0,
 };
 
-/** Extended Time can push the clock out by at most this much, per the rules. */
-const MAX_CLOCK_BUMP = CONFIG.extendedTimeThresholdSec - CONFIG.lastCallSec;
+/** The whole run the stored clock counts down: bidding clock plus Last Call. */
+const TOTAL_RUN = CONFIG.auctionLengthSec + CONFIG.lastCallSec;
+
+/**
+ * Extended Time can push the clock out by at most this much, per the rules —
+ * the threshold itself, since it is a mark on the main clock.
+ */
+const MAX_CLOCK_BUMP = CONFIG.extendedTimeThresholdSec;
 
 let env: RulesTestEnvironment;
 
@@ -83,24 +91,31 @@ beforeEach(async () => {
       ownerUid: OWNER_UID,
       nextSeq: 10,
       startedAt: nowSec() - 30,
-      auctionLength: CONFIG.auctionLengthSec,
+      auctionLength: TOTAL_RUN,
       showResults: false,
       createdAt: nowSec() - 60,
     });
 
-    const people: Array<[string, string, string, string | null]> = [
-      [OWNER_KEY, 'owner', 'Organiser', OWNER_UID],
-      [ALICE_KEY, 'bidder', 'Alice', ALICE_UID],
-      [BOB_KEY, 'bidder', 'Bob', BOB_UID],
-      [CAROL_KEY, 'bidder', 'Carol', null],
+    const people: Array<[string, string, string, string, string | null]> = [
+      [OWNER_KEY, 'owner', 'Auctioneer', 'Organiser', OWNER_UID],
+      [ALICE_KEY, 'bidder', 'Supplier A', 'Alice', ALICE_UID],
+      [BOB_KEY, 'bidder', 'Supplier B', 'Bob', BOB_UID],
+      [CAROL_KEY, 'bidder', 'Supplier C', 'Carol', null],
+      [DAVE_KEY, 'viewer', 'Observer', 'Dave', DAVE_UID],
     ];
-    for (const [publicKey, role, name, claimUid] of people) {
+    for (const [publicKey, role, label, name, claimUid] of people) {
       await setDoc(doc(db, 'auctions', AUCTION, 'users', publicKey), {
         publicKey,
         role,
-        name,
+        label,
+        colorIndex: 0,
         claimUid,
         claimInviteId: null,
+      });
+      // Real names live only here — see the anonymity block near the bottom.
+      await setDoc(doc(db, 'auctions', AUCTION, 'identities', publicKey), {
+        name,
+        email: `${name.toLowerCase()}@example.com`,
       });
       if (claimUid) {
         await setDoc(doc(db, 'auctions', AUCTION, 'claims', claimUid), { publicKey, role });
@@ -112,7 +127,7 @@ beforeEach(async () => {
       seq: 9,
       type: 'startAuction',
       time: nowSec() - 30,
-      auctionLength: CONFIG.auctionLengthSec,
+      auctionLength: TOTAL_RUN,
     });
   });
 });
@@ -141,7 +156,9 @@ const adminEvent = (over: Record<string, unknown> = {}) => ({
 });
 
 describe('admin events are owner-only', () => {
-  const ownerOnly = ['setName', 'addUser', 'addLot', 'renameLot', 'cancelBid', 'startAuction', 'showResults'];
+  // `cancelBid` is deliberately not here: a supplier may withdraw a bid of
+  // their own, which the block below covers on its own terms.
+  const ownerOnly = ['setName', 'addUser', 'addLot', 'renameLot', 'startAuction', 'showResults'];
 
   for (const type of ownerOnly) {
     it(`lets the owner write ${type}`, async () => {
@@ -203,6 +220,69 @@ describe('bidding as yourself', () => {
   });
 });
 
+/**
+ * Withdrawing a bid. Suppliers mistype bids and sometimes wreck an auction on
+ * purpose, so both the supplier and the auctioneer can take one back — but a
+ * supplier only their own. The rules cannot follow `bidSeq` to the bid it
+ * points at, so they hold a supplier to cancellations that *name* them; the
+ * shared fold then ignores any cancellation whose named bidder is not the
+ * target bid's actual bidder (covered in `tests/validation.test.ts`).
+ */
+describe('withdrawing a bid', () => {
+  const cancel = (over: Record<string, unknown> = {}) => ({
+    seq: 10,
+    type: 'cancelBid',
+    bidSeq: 4,
+    bidder: ALICE_KEY,
+    time: nowSec(),
+    ...over,
+  });
+
+  it('lets a supplier withdraw a bid of their own', async () => {
+    await assertSucceeds(setDoc(eventRef(as(ALICE_UID), 10), cancel()));
+  });
+
+  it('refuses a supplier withdrawing a bid named as a rival\'s', async () => {
+    await assertFails(setDoc(eventRef(as(BOB_UID), 10), cancel({ bidder: ALICE_KEY })));
+  });
+
+  it('refuses a cancellation that names nobody', async () => {
+    const db = as(ALICE_UID);
+    await assertFails(setDoc(eventRef(db, 10), { seq: 10, type: 'cancelBid', bidSeq: 4, time: nowSec() }));
+  });
+
+  it('lets the auctioneer withdraw anyone\'s bid', async () => {
+    await assertSucceeds(setDoc(eventRef(as(OWNER_UID), 10), cancel({ bidder: BOB_KEY })));
+  });
+
+  it('refuses the watching client withdrawing anything', async () => {
+    await assertFails(setDoc(eventRef(as(DAVE_UID), 10), cancel({ bidder: DAVE_KEY })));
+    await assertFails(setDoc(eventRef(as(DAVE_UID), 10), cancel({ bidder: ALICE_KEY })));
+  });
+
+  it('refuses a stranger and an unauthenticated client', async () => {
+    await assertFails(setDoc(eventRef(as(STRANGER_UID), 10), cancel()));
+    await assertFails(setDoc(eventRef(as(null), 10), cancel()));
+  });
+});
+
+/** The client on the buying side watches; it never writes. */
+describe('the watching client has no control', () => {
+  it('refuses every event type from an observer', async () => {
+    const db = as(DAVE_UID);
+    for (const type of ['setName', 'addUser', 'addLot', 'renameLot', 'startAuction', 'showResults']) {
+      await assertFails(setDoc(eventRef(db, 10), adminEvent({ type })));
+    }
+    await assertFails(setDoc(eventRef(db, 10), bid({ bidder: DAVE_KEY })));
+    await assertFails(setDoc(eventRef(db, 10), bid({ bidder: ALICE_KEY })));
+  });
+
+  it('refuses an observer bumping the shared clock', async () => {
+    const db = as(DAVE_UID);
+    await assertFails(updateDoc(doc(db, 'auctions', AUCTION), { nextSeq: 11 }));
+  });
+});
+
 describe('the bidding window', () => {
   it('refuses a bid before the auction has started', async () => {
     await env.withSecurityRulesDisabled(async (ctx) => {
@@ -215,7 +295,7 @@ describe('the bidding window', () => {
   it('refuses a bid after the clock has run out', async () => {
     await env.withSecurityRulesDisabled(async (ctx) => {
       await updateDoc(doc(ctx.firestore(), 'auctions', AUCTION), {
-        startedAt: nowSec() - (CONFIG.auctionLengthSec + 120),
+        startedAt: nowSec() - (TOTAL_RUN + 120),
       });
     });
     const db = as(ALICE_UID);
@@ -274,7 +354,7 @@ describe('the auction doc bump a bidder is allowed alongside a bid', () => {
     await assertSucceeds(
       updateDoc(auctionDoc(db), {
         nextSeq: 11,
-        auctionLength: CONFIG.auctionLengthSec + MAX_CLOCK_BUMP,
+        auctionLength: TOTAL_RUN + MAX_CLOCK_BUMP,
       }),
     );
   });
@@ -285,7 +365,7 @@ describe('the auction doc bump a bidder is allowed alongside a bid', () => {
     await assertFails(
       updateDoc(auctionDoc(db), {
         nextSeq: 11,
-        auctionLength: CONFIG.auctionLengthSec + MAX_CLOCK_BUMP + 1,
+        auctionLength: TOTAL_RUN + MAX_CLOCK_BUMP + 1,
       }),
     );
   });
@@ -471,6 +551,68 @@ describe('collections that must never be enumerable', () => {
   });
 });
 
+/**
+ * The auction's central promise to a supplier: they may learn where their
+ * price stands in the market, and nothing whatever about *whose* prices those
+ * are. Unlike the blind Last Call window, this one is not cosmetic — names are
+ * kept out of the event log entirely and put behind this rule, so a hostile
+ * client reading Firestore directly gets no further than a well-behaved one.
+ */
+describe('supplier anonymity', () => {
+  const identityDoc = (db: ReturnType<typeof as>, publicKey: string) =>
+    doc(db, 'auctions', AUCTION, 'identities', publicKey);
+  const slotDoc = (db: ReturnType<typeof as>, publicKey: string) =>
+    doc(db, 'auctions', AUCTION, 'users', publicKey);
+
+  it('refuses a supplier reading a rival identity, before or after results', async () => {
+    const db = as(ALICE_UID);
+    await assertFails(getDoc(identityDoc(db, BOB_KEY)));
+    await assertFails(getDoc(identityDoc(db, CAROL_KEY)));
+
+    // Releasing results reveals prices, never firms.
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await updateDoc(doc(ctx.firestore(), 'auctions', AUCTION), { showResults: true });
+    });
+    await assertFails(getDoc(identityDoc(db, BOB_KEY)));
+  });
+
+  it('refuses a supplier enumerating the identities collection', async () => {
+    await assertFails(getDocs(collection(as(ALICE_UID), 'auctions', AUCTION, 'identities')));
+    await assertFails(getDocs(collection(as(STRANGER_UID), 'auctions', AUCTION, 'identities')));
+  });
+
+  it('lets a supplier read their own identity', async () => {
+    await assertSucceeds(getDoc(identityDoc(as(ALICE_UID), ALICE_KEY)));
+  });
+
+  it('lets the auctioneer and the buying-side observer read every identity', async () => {
+    for (const uid of [OWNER_UID, DAVE_UID]) {
+      const db = as(uid);
+      await assertSucceeds(getDoc(identityDoc(db, ALICE_KEY)));
+      await assertSucceeds(getDocs(collection(db, 'auctions', AUCTION, 'identities')));
+    }
+  });
+
+  it('refuses a stranger with the auction id reading any identity', async () => {
+    await assertFails(getDoc(identityDoc(as(STRANGER_UID), ALICE_KEY)));
+    await assertFails(getDoc(identityDoc(as(null), ALICE_KEY)));
+  });
+
+  it('refuses anyone but the auctioneer creating an identity, and any rewrite', async () => {
+    await assertFails(setDoc(identityDoc(as(ALICE_UID), 'pk-new'), { name: 'Forged' }));
+    await assertSucceeds(setDoc(identityDoc(as(OWNER_UID), 'pk-new'), { name: 'Legit' }));
+    await assertFails(updateDoc(identityDoc(as(OWNER_UID), ALICE_KEY), { name: 'Renamed' }));
+    await assertFails(deleteDoc(identityDoc(as(OWNER_UID), ALICE_KEY)));
+  });
+
+  it('leaves no name in the slots a supplier *can* read', async () => {
+    const snap = await getDoc(slotDoc(as(ALICE_UID), BOB_KEY));
+    expect(snap.data()).toMatchObject({ role: 'bidder', label: 'Supplier B' });
+    expect(snap.data()!.name).toBeUndefined();
+    expect(snap.data()!.email).toBeUndefined();
+  });
+});
+
 describe('unauthenticated clients', () => {
   it('cannot read or write anything', async () => {
     const db = as(null);
@@ -483,9 +625,10 @@ describe('unauthenticated clients', () => {
 /**
  * Not a rule test — a standing reminder of the accepted gap. Any signed-in
  * client holding the auction id can read the whole log, which is what makes
- * bidder anonymity and the blind Last Call window cosmetic rather than
- * enforced. If this ever starts failing, the rules gained per-role read
- * scoping and the project notes should be updated to match.
+ * the blind Last Call window cosmetic rather than enforced. Anonymity is no
+ * longer in that category: the log is readable, but it contains no names to
+ * read (see "supplier anonymity" above). If this ever starts failing, the
+ * rules gained per-role read scoping and the notes should be updated to match.
  */
 describe('known limitation: the log is readable by any signed-in client', () => {
   it('lets a stranger with the auction id read every bid', async () => {

@@ -1,11 +1,11 @@
-import { AuctionAggregate, type StoredUser } from '../src/shared/aggregate';
+import { AuctionAggregate, type Participant } from '../src/shared/aggregate';
 import type { AuctionConfig, AuctionEvent, InboundEventInput, Role } from '../src/shared/types';
 import { parseConfig } from '../src/shared/config';
 import { validateInbound, type InboundResult } from '../src/shared/validation';
 
 export const T0 = 1_000_000;
 
-export const SYSTEM: StoredUser = { publicKey: '__system__', role: 'owner', name: 'System' };
+export const SYSTEM: Participant = { publicKey: '__system__', role: 'owner' };
 
 /**
  * Drives an aggregate through the real inbound validator with an explicit
@@ -17,7 +17,7 @@ export function makeAuction(config: Partial<AuctionConfig> = {}) {
   const log: AuctionEvent[] = [];
   let seq = 0;
 
-  function submit(input: InboundEventInput, actor: StoredUser, now = T0): InboundResult {
+  function submit(input: InboundEventInput, actor: Participant, now = T0): InboundResult {
     const result = validateInbound(agg, input, actor, now, seq);
     if (result.ok) {
       agg.apply(result.event);
@@ -27,10 +27,21 @@ export function makeAuction(config: Partial<AuctionConfig> = {}) {
     return result;
   }
 
-  function addUser(name: string, role: Role): StoredUser {
+  /**
+   * The real name goes in but never comes back out of the log — it is carried
+   * here only so a test can assert that. What a participant is actually known
+   * by afterwards is `label`.
+   */
+  function addUser(name: string, role: Role) {
     const result = submit({ type: 'addUser', name, role }, SYSTEM);
     if (!result.ok) throw new Error(result.error);
-    return { publicKey: result.event.publicKey as string, role, name };
+    return {
+      publicKey: result.event.publicKey as string,
+      role,
+      name,
+      label: result.event.label as string,
+      colorIndex: result.event.colorIndex as number,
+    };
   }
 
   function addLot(name: string): string {

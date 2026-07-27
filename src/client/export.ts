@@ -25,23 +25,37 @@ function download(filename: string, rows: string[][]): void {
   URL.revokeObjectURL(url);
 }
 
+/**
+ * Both exports carry the anonymous label next to the firm, so the auctioneer
+ * can reconcile their sheet against the board the suppliers were looking at.
+ * `name` falls back to the label for any identity the exporter could not read,
+ * so an observer's export is anonymous rather than wrong.
+ */
 export function exportResultsCsv(agg: AuctionAggregate): void {
-  const rows = [['lot', 'winner', 'winning_bid', 'bid_count']];
+  const rows = [['lot', 'winner', 'winner_label', 'winning_bid', 'bid_count']];
   for (const { lot, winner, bid, bidCount } of agg.results()) {
-    rows.push([lot.name, winner?.name ?? '', bid ? String(bid.value) : '', String(bidCount)]);
+    rows.push([
+      lot.name,
+      winner?.name ?? '',
+      winner?.label ?? '',
+      bid ? String(bid.value) : '',
+      String(bidCount),
+    ]);
   }
   download(`${slug(agg.name)}-results.csv`, rows);
 }
 
 export function exportBidsCsv(agg: AuctionAggregate): void {
-  const rows = [['seq', 'lot', 'bidder', 'value', 'seconds_into_auction', 'cancelled']];
+  const rows = [['seq', 'lot', 'bidder', 'bidder_label', 'value', 'seconds_into_auction', 'cancelled']];
   for (const bid of agg.bids) {
     const lot = agg.lots.get(bid.lotId);
+    const bidder = agg.users.get(bid.bidder);
     const offset = agg.startTime === null ? '' : (bid.time - agg.startTime).toFixed(1);
     rows.push([
       String(bid.seq),
       lot?.name ?? bid.lotId,
-      agg.users.get(bid.bidder)?.name ?? bid.bidder,
+      bidder?.name ?? bid.bidder,
+      bidder?.label ?? '',
       String(bid.value),
       offset,
       agg.cancelledBids.has(bid.seq) ? 'yes' : 'no',
