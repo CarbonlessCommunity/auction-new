@@ -85,9 +85,13 @@ describe('limits', () => {
     ctx.addUser('Organiser', 'owner');
     for (let i = 0; i < 12; i += 1) ctx.addUser(`Supplier ${i}`, 'bidder');
 
-    expect(ctx.submit({ type: 'addUser', name: 'One too many', role: 'bidder' }, SYSTEM).ok).toBe(false);
+    expect(
+      ctx.submit({ type: 'addUser', name: 'One too many', role: 'bidder', email: 'late@example.com' }, SYSTEM).ok,
+    ).toBe(false);
     // The cap is on bidding firms, not on observers.
-    expect(ctx.submit({ type: 'addUser', name: 'The client', role: 'viewer' }, SYSTEM).ok).toBe(true);
+    expect(
+      ctx.submit({ type: 'addUser', name: 'The client', role: 'viewer', email: 'client@example.com' }, SYSTEM).ok,
+    ).toBe(true);
 
     for (let i = 0; i < 5; i += 1) ctx.addLot(`${(i + 1) * 12} Months`);
     expect(ctx.submit({ type: 'addLot', name: '72 Months' }, SYSTEM).ok).toBe(false);

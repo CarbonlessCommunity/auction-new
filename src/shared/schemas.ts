@@ -15,7 +15,9 @@ export const eventSchemas = {
     type: z.literal('addUser'),
     name,
     role: z.enum(['owner', 'bidder', 'viewer']),
-    email: z.string().email().max(200).optional(),
+    // Not optional: without an address there is nothing to key a seat by and
+    // no way for the participant to ever sign in.
+    email: z.string().trim().toLowerCase().email().max(200),
   }),
   addLot: z.object({ type: z.literal('addLot'), name }),
   renameLot: z.object({ type: z.literal('renameLot'), lotId: z.string().min(1), name }),

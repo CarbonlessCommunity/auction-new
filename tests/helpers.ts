@@ -28,17 +28,18 @@ export function makeAuction(config: Partial<AuctionConfig> = {}) {
   }
 
   /**
-   * The real name goes in but never comes back out of the log — it is carried
-   * here only so a test can assert that. What a participant is actually known
-   * by afterwards is `label`.
+   * The real name and email go in but never come back out of the log — they are
+   * carried here only so a test can assert that. What a participant is actually
+   * known by afterwards is `label`; the address only ever reaches their seat.
    */
-  function addUser(name: string, role: Role) {
-    const result = submit({ type: 'addUser', name, role }, SYSTEM);
+  function addUser(name: string, role: Role, email = `${name.replace(/\W+/g, '.').toLowerCase()}@example.com`) {
+    const result = submit({ type: 'addUser', name, role, email }, SYSTEM);
     if (!result.ok) throw new Error(result.error);
     return {
       publicKey: result.event.publicKey as string,
       role,
       name,
+      email,
       label: result.event.label as string,
       colorIndex: result.event.colorIndex as number,
     };

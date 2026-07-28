@@ -1,16 +1,48 @@
-import { createAuction } from '../connection';
+import { createAuction, type CreateAuctionInput } from '../connection';
+import { currentUser, sendSignInLink, signOutNow } from '../auth';
 import { DEFAULT_CONFIG, MAX_BIDDERS, MAX_LOTS } from '../../shared/rules';
 import type { BidDirection } from '../../shared/types';
-import { toast } from '../format';
+import { escapeHtml, toast } from '../format';
 
-/** The Create Auction page — the modern replacement for `view/create.html`. */
+/**
+ * Where a filled-in auction is parked while the creator goes to their inbox.
+ *
+ * Creating an auction needs a verified address — the auctioneer holds a seat
+ * like everyone else — but making someone sign in *before* they may type
+ * anything is a poor trade for a form they came here to fill in. So they fill
+ * it in, and it waits here across the round trip through their email.
+ */
+const PENDING_DRAFT_KEY = 'auction:pendingDraft';
+
+/** The Create Auction page. */
 export function renderCreate(root: HTMLElement): void {
+  void paint(root);
+}
+
+async function paint(root: HTMLElement): Promise<void> {
+  const user = await currentUser();
+  const signedIn = user?.email && user.emailVerified ? user.email : null;
+
+  // Coming back from the inbox with a draft still waiting: finish the job they
+  // started rather than making them retype it.
+  const draft = readDraft();
+  if (signedIn && draft) {
+    clearDraft();
+    renderCreating(root);
+    await create(root, draft);
+    return;
+  }
+
+  renderForm(root, signedIn);
+}
+
+function renderForm(root: HTMLElement, signedIn: string | null): void {
   root.innerHTML = `
     <div class="create">
       <h1>Create an auction</h1>
       <p class="sub">
-        A live, timed auction. You will get an auctioneer link, plus an invite
-        link for every participant you add.
+        A live, timed auction. You run it from your own account, and invite each
+        supplier and client by email — nobody shares a link or a password.
       </p>
 
       <form id="create-form" class="card">
@@ -30,10 +62,22 @@ export function renderCreate(root: HTMLElement): void {
           <span>Your name</span>
           <input name="ownerName" required maxlength="120" placeholder="Auctioneer" value="Auctioneer" />
         </label>
-        <label>
-          <span>Your email (optional)</span>
-          <input name="email" type="email" maxlength="200" placeholder="you@example.com" />
-        </label>
+        ${
+          signedIn
+            ? `<p class="signed-in">
+                 Signed in as <strong>${escapeHtml(signedIn)}</strong>.
+                 <button type="button" class="link" data-act="signout">not you?</button>
+               </p>`
+            : `<label>
+                 <span>Your email</span>
+                 <input name="email" type="email" required maxlength="200"
+                        placeholder="you@yourfirm.com" autocomplete="email" />
+                 <small class="muted">
+                   We email you a sign-in link to confirm it. This is the address you
+                   will run the auction from, on any device.
+                 </small>
+               </label>`
+        }
 
         <details>
           <summary class="muted" style="cursor:pointer;margin:0.5rem 0 1rem">Auction rules</summary>
@@ -78,16 +122,23 @@ export function renderCreate(root: HTMLElement): void {
           </p>
         </details>
 
-        <button class="primary" type="submit" style="width:100%">Create auction</button>
+        <button class="primary" type="submit" style="width:100%">
+          ${signedIn ? 'Create auction' : 'Continue — we’ll email you a link'}
+        </button>
       </form>
     </div>
   `;
 
   const form = root.querySelector<HTMLFormElement>('#create-form')!;
 
+  root.querySelector('[data-act="signout"]')?.addEventListener('click', async () => {
+    await signOutNow();
+    void paint(root);
+  });
+
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
-    const button = form.querySelector('button')!;
+    const button = form.querySelector('button[type="submit"]')!  as HTMLButtonElement;
     button.disabled = true;
 
     const data = new FormData(form);
@@ -104,10 +155,9 @@ export function renderCreate(root: HTMLElement): void {
       return;
     }
 
-    const result = await createAuction({
+    const input: CreateAuctionInput = {
       name: String(data.get('name')),
       ownerName: String(data.get('ownerName')),
-      email: (data.get('email') as string) || undefined,
       lots,
       config: {
         bidDirection: data.get('bidDirection') as BidDirection,
@@ -117,13 +167,79 @@ export function renderCreate(root: HTMLElement): void {
         lastCallBidders: number('lastCallBidders'),
         minBidStep: number('minBidStep'),
       },
-    });
+    };
 
-    if (result.ok && result.id) {
-      location.href = `/a/${result.id}`;
-    } else {
-      toast(result.error ?? 'Could not create the auction.', 'error');
+    if (signedIn) {
+      await create(root, input);
       button.disabled = false;
+      return;
     }
+
+    const email = String(data.get('email'));
+    writeDraft(input);
+    const sent = await sendSignInLink(email, `${location.origin}/`, true);
+    if (!sent.ok) {
+      clearDraft();
+      toast(sent.error ?? 'Could not send the link.', 'error');
+      button.disabled = false;
+      return;
+    }
+    renderLinkSent(root, email);
   });
+}
+
+function renderLinkSent(root: HTMLElement, email: string): void {
+  root.innerHTML = `
+    <div class="create">
+      <h1>Check your email</h1>
+      <p class="sub">
+        A sign-in link is on its way to <strong>${escapeHtml(email)}</strong>.
+        Open it and your auction will be created — everything you typed is saved.
+      </p>
+    </div>`;
+}
+
+function renderCreating(root: HTMLElement): void {
+  root.innerHTML = `<div class="create"><h1>Creating your auction…</h1></div>`;
+}
+
+async function create(root: HTMLElement, input: CreateAuctionInput): Promise<void> {
+  const result = await createAuction(input);
+  if (result.ok && result.id) {
+    location.href = `/a/${result.id}`;
+    return;
+  }
+  toast(result.error ?? 'Could not create the auction.', 'error');
+  renderForm(root, (await currentUser())?.email ?? null);
+}
+
+// --- the parked draft ------------------------------------------------------
+
+function writeDraft(input: CreateAuctionInput): void {
+  localStorage.setItem(PENDING_DRAFT_KEY, JSON.stringify(input));
+}
+
+function clearDraft(): void {
+  localStorage.removeItem(PENDING_DRAFT_KEY);
+}
+
+/**
+ * A draft is only ever written by this page one moment earlier, but it is read
+ * back out of storage a browser hop later — so treat it as untrusted and drop
+ * anything that no longer parses rather than half-creating an auction from it.
+ */
+function readDraft(): CreateAuctionInput | null {
+  const raw = localStorage.getItem(PENDING_DRAFT_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as CreateAuctionInput;
+    if (!parsed?.name || !parsed?.ownerName || !Array.isArray(parsed.lots) || !parsed.config) {
+      clearDraft();
+      return null;
+    }
+    return parsed;
+  } catch {
+    clearDraft();
+    return null;
+  }
 }

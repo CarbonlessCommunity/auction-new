@@ -23,15 +23,36 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 const PROJECT_ID = 'carbonless-auction';
 const AUCTION = 'a1';
 
-const OWNER_UID = 'uid-owner';
-const ALICE_UID = 'uid-alice';
-const BOB_UID = 'uid-bob';
-const DAVE_UID = 'uid-dave'; // an observer on the buying side
-const STRANGER_UID = 'uid-stranger';
+/**
+ * A signed-in browser. Identity here is the *verified email* on the token, not
+ * the uid — that is the whole change these rules are built around, so the
+ * fixtures make the distinction explicit and the two are varied independently
+ * below (same address on a new uid, same uid with an unverified address).
+ */
+interface Person {
+  uid: string;
+  email?: string;
+  /** Defaults to true. Set false to model a sign-in method that never proved the address. */
+  verified?: boolean;
+}
+
+const OWNER: Person = { uid: 'uid-owner', email: 'organiser@example.com' };
+const ALICE: Person = { uid: 'uid-alice', email: 'alice@example.com' };
+const BOB: Person = { uid: 'uid-bob', email: 'bob@example.com' };
+const DAVE: Person = { uid: 'uid-dave', email: 'dave@example.com' }; // observer, buying side
+const CAROL: Person = { uid: 'uid-carol', email: 'carol@example.com' }; // invited, never signed in
+const STRANGER: Person = { uid: 'uid-stranger', email: 'nobody@example.com' };
+
+/** Alice from a second laptop: same address, a uid these rules have never seen. */
+const ALICE_ELSEWHERE: Person = { uid: 'uid-alice-laptop-2', email: ALICE.email };
+/** Alice's address on a token that never proved it. */
+const ALICE_UNVERIFIED: Person = { uid: 'uid-alice-fake', email: ALICE.email, verified: false };
+/** A session with no address at all — what anonymous sign-in used to produce. */
+const ANONYMOUS: Person = { uid: 'uid-anon' };
 
 const ALICE_KEY = 'pk-alice';
 const BOB_KEY = 'pk-bob';
-const CAROL_KEY = 'pk-carol'; // invited, never claimed
+const CAROL_KEY = 'pk-carol';
 const DAVE_KEY = 'pk-dave';
 const OWNER_KEY = 'pk-owner';
 const LOT = 'lot-0';
@@ -76,9 +97,10 @@ afterAll(async () => {
 });
 
 /**
- * A started auction with an owner, two claimed bidders (Alice, Bob) and one
- * invited-but-unclaimed slot (Carol). Written with rules disabled so that the
- * fixture itself never depends on the rules under test.
+ * A started auction with an auctioneer, three seated suppliers (Alice and Bob
+ * have signed in, Carol has been invited but never has) and an observer.
+ * Written with rules disabled so the fixture itself never depends on the rules
+ * under test.
  */
 beforeEach(async () => {
   await env.clearFirestore();
@@ -88,7 +110,7 @@ beforeEach(async () => {
     await setDoc(doc(db, 'auctions', AUCTION), {
       name: 'Rules Fixture',
       config: CONFIG,
-      ownerUid: OWNER_UID,
+      ownerUid: OWNER.uid,
       nextSeq: 10,
       startedAt: nowSec() - 30,
       auctionLength: TOTAL_RUN,
@@ -96,31 +118,33 @@ beforeEach(async () => {
       createdAt: nowSec() - 60,
     });
 
-    const people: Array<[string, string, string, string, string | null]> = [
-      [OWNER_KEY, 'owner', 'Auctioneer', 'Organiser', OWNER_UID],
-      [ALICE_KEY, 'bidder', 'Supplier A', 'Alice', ALICE_UID],
-      [BOB_KEY, 'bidder', 'Supplier B', 'Bob', BOB_UID],
-      [CAROL_KEY, 'bidder', 'Supplier C', 'Carol', null],
-      [DAVE_KEY, 'viewer', 'Observer', 'Dave', DAVE_UID],
+    const people: Array<[string, string, string, string, Person, boolean]> = [
+      [OWNER_KEY, 'owner', 'Auctioneer', 'Organiser', OWNER, true],
+      [ALICE_KEY, 'bidder', 'Supplier A', 'Alice', ALICE, true],
+      [BOB_KEY, 'bidder', 'Supplier B', 'Bob', BOB, true],
+      [CAROL_KEY, 'bidder', 'Supplier C', 'Carol', CAROL, false],
+      [DAVE_KEY, 'viewer', 'Observer', 'Dave', DAVE, true],
     ];
-    for (const [publicKey, role, label, name, claimUid] of people) {
+    for (const [publicKey, role, label, name, person, signedIn] of people) {
+      // The public roster slot: nothing identifying, readable by anyone.
       await setDoc(doc(db, 'auctions', AUCTION, 'users', publicKey), {
         publicKey,
         role,
         label,
         colorIndex: 0,
-        claimUid,
-        claimInviteId: null,
       });
       // Real names live only here — see the anonymity block near the bottom.
       await setDoc(doc(db, 'auctions', AUCTION, 'identities', publicKey), {
         name,
-        email: `${name.toLowerCase()}@example.com`,
+        email: person.email,
       });
-      if (claimUid) {
-        await setDoc(doc(db, 'auctions', AUCTION, 'claims', claimUid), { publicKey, role });
-      }
-      await setDoc(doc(db, 'auctions', AUCTION, 'invites', 'invite-' + publicKey), { publicKey });
+      // The seat: what actually admits them, keyed by the invited address.
+      await setDoc(doc(db, 'auctions', AUCTION, 'seats', person.email!), {
+        publicKey,
+        role,
+        invitedAt: nowSec() - 120,
+        ...(signedIn ? { claimedUid: person.uid, claimedAt: nowSec() - 60 } : {}),
+      });
     }
 
     await setDoc(doc(db, 'auctions', AUCTION, 'events', '9'), {
@@ -132,8 +156,14 @@ beforeEach(async () => {
   });
 });
 
-const as = (uid: string | null) =>
-  (uid === null ? env.unauthenticatedContext() : env.authenticatedContext(uid)).firestore();
+/** A Firestore handle acting as `person`, with their address on the token. */
+function as(person: Person | null) {
+  if (person === null) return env.unauthenticatedContext().firestore();
+  const token = person.email
+    ? { email: person.email, email_verified: person.verified ?? true }
+    : {};
+  return env.authenticatedContext(person.uid, token).firestore();
+}
 
 const eventRef = (db: ReturnType<typeof as>, seq: number) =>
   doc(db, 'auctions', AUCTION, 'events', String(seq));
@@ -162,41 +192,41 @@ describe('admin events are owner-only', () => {
 
   for (const type of ownerOnly) {
     it(`lets the owner write ${type}`, async () => {
-      const db = as(OWNER_UID);
+      const db = as(OWNER);
       await assertSucceeds(setDoc(eventRef(db, 10), adminEvent({ type })));
     });
 
     it(`refuses ${type} from a claimed bidder`, async () => {
-      const db = as(ALICE_UID);
+      const db = as(ALICE);
       await assertFails(setDoc(eventRef(db, 10), adminEvent({ type })));
     });
 
     it(`refuses ${type} from a signed-in stranger`, async () => {
-      const db = as(STRANGER_UID);
+      const db = as(STRANGER);
       await assertFails(setDoc(eventRef(db, 10), adminEvent({ type })));
     });
   }
 
   it('refuses an unknown event type even from the owner', async () => {
-    const db = as(OWNER_UID);
+    const db = as(OWNER);
     await assertFails(setDoc(eventRef(db, 10), adminEvent({ type: 'grantMyselfEverything' })));
   });
 });
 
 describe('bidding as yourself', () => {
   it('lets a claimed bidder bid under their own publicKey', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertSucceeds(setDoc(eventRef(db, 10), bid()));
   });
 
   /** The core impersonation check: Bob must not be able to bid as Alice. */
   it('refuses a bidder forging a rival publicKey', async () => {
-    const db = as(BOB_UID);
+    const db = as(BOB);
     await assertFails(setDoc(eventRef(db, 10), bid({ bidder: ALICE_KEY })));
   });
 
   it('refuses a bid from an unclaimed slot holder', async () => {
-    const db = as(STRANGER_UID);
+    const db = as(STRANGER);
     await assertFails(setDoc(eventRef(db, 10), bid({ bidder: CAROL_KEY })));
   });
 
@@ -210,12 +240,12 @@ describe('bidding as yourself', () => {
    * bidder who could set it would bypass the as-self publicKey check entirely.
    */
   it('refuses a bidder who sets placedBy to masquerade as an on-behalf bid', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertFails(setDoc(eventRef(db, 10), bid({ bidder: BOB_KEY, placedBy: OWNER_KEY })));
   });
 
   it('lets the owner place an on-behalf bid for any supplier', async () => {
-    const db = as(OWNER_UID);
+    const db = as(OWNER);
     await assertSucceeds(setDoc(eventRef(db, 10), bid({ bidder: BOB_KEY, placedBy: OWNER_KEY })));
   });
 });
@@ -239,29 +269,29 @@ describe('withdrawing a bid', () => {
   });
 
   it('lets a supplier withdraw a bid of their own', async () => {
-    await assertSucceeds(setDoc(eventRef(as(ALICE_UID), 10), cancel()));
+    await assertSucceeds(setDoc(eventRef(as(ALICE), 10), cancel()));
   });
 
   it('refuses a supplier withdrawing a bid named as a rival\'s', async () => {
-    await assertFails(setDoc(eventRef(as(BOB_UID), 10), cancel({ bidder: ALICE_KEY })));
+    await assertFails(setDoc(eventRef(as(BOB), 10), cancel({ bidder: ALICE_KEY })));
   });
 
   it('refuses a cancellation that names nobody', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertFails(setDoc(eventRef(db, 10), { seq: 10, type: 'cancelBid', bidSeq: 4, time: nowSec() }));
   });
 
   it('lets the auctioneer withdraw anyone\'s bid', async () => {
-    await assertSucceeds(setDoc(eventRef(as(OWNER_UID), 10), cancel({ bidder: BOB_KEY })));
+    await assertSucceeds(setDoc(eventRef(as(OWNER), 10), cancel({ bidder: BOB_KEY })));
   });
 
   it('refuses the watching client withdrawing anything', async () => {
-    await assertFails(setDoc(eventRef(as(DAVE_UID), 10), cancel({ bidder: DAVE_KEY })));
-    await assertFails(setDoc(eventRef(as(DAVE_UID), 10), cancel({ bidder: ALICE_KEY })));
+    await assertFails(setDoc(eventRef(as(DAVE), 10), cancel({ bidder: DAVE_KEY })));
+    await assertFails(setDoc(eventRef(as(DAVE), 10), cancel({ bidder: ALICE_KEY })));
   });
 
   it('refuses a stranger and an unauthenticated client', async () => {
-    await assertFails(setDoc(eventRef(as(STRANGER_UID), 10), cancel()));
+    await assertFails(setDoc(eventRef(as(STRANGER), 10), cancel()));
     await assertFails(setDoc(eventRef(as(null), 10), cancel()));
   });
 });
@@ -269,7 +299,7 @@ describe('withdrawing a bid', () => {
 /** The client on the buying side watches; it never writes. */
 describe('the watching client has no control', () => {
   it('refuses every event type from an observer', async () => {
-    const db = as(DAVE_UID);
+    const db = as(DAVE);
     for (const type of ['setName', 'addUser', 'addLot', 'renameLot', 'startAuction', 'showResults']) {
       await assertFails(setDoc(eventRef(db, 10), adminEvent({ type })));
     }
@@ -278,7 +308,7 @@ describe('the watching client has no control', () => {
   });
 
   it('refuses an observer bumping the shared clock', async () => {
-    const db = as(DAVE_UID);
+    const db = as(DAVE);
     await assertFails(updateDoc(doc(db, 'auctions', AUCTION), { nextSeq: 11 }));
   });
 });
@@ -288,7 +318,7 @@ describe('the bidding window', () => {
     await env.withSecurityRulesDisabled(async (ctx) => {
       await updateDoc(doc(ctx.firestore(), 'auctions', AUCTION), { startedAt: null });
     });
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertFails(setDoc(eventRef(db, 10), bid()));
   });
 
@@ -298,30 +328,30 @@ describe('the bidding window', () => {
         startedAt: nowSec() - (TOTAL_RUN + 120),
       });
     });
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertFails(setDoc(eventRef(db, 10), bid()));
   });
 });
 
 describe('the event log is append-only and gapless', () => {
   it('refuses an event whose seq does not match nextSeq', async () => {
-    const db = as(OWNER_UID);
+    const db = as(OWNER);
     await assertFails(setDoc(eventRef(db, 11), adminEvent({ seq: 11 })));
     await assertFails(setDoc(eventRef(db, 9), adminEvent({ seq: 9 })));
   });
 
   it('refuses overwriting an existing event', async () => {
-    const db = as(OWNER_UID);
+    const db = as(OWNER);
     await assertFails(updateDoc(eventRef(db, 9), { type: 'setName', name: 'rewritten' }));
   });
 
   it('refuses deleting an event', async () => {
-    const db = as(OWNER_UID);
+    const db = as(OWNER);
     await assertFails(deleteDoc(eventRef(db, 9)));
   });
 
   it('lets any signed-in member read the log', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertSucceeds(getDocs(collection(db, 'auctions', AUCTION, 'events')));
   });
 });
@@ -335,22 +365,22 @@ describe('the auction doc bump a bidder is allowed alongside a bid', () => {
   const auctionDoc = (db: ReturnType<typeof as>) => doc(db, 'auctions', AUCTION);
 
   it('allows exactly nextSeq + 1', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertSucceeds(updateDoc(auctionDoc(db), { nextSeq: 11 }));
   });
 
   it('refuses skipping seq numbers', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertFails(updateDoc(auctionDoc(db), { nextSeq: 12 }));
   });
 
   it('refuses rewinding seq', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertFails(updateDoc(auctionDoc(db), { nextSeq: 9 }));
   });
 
   it('allows an Extended Time clock bump up to threshold - lastCall', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertSucceeds(
       updateDoc(auctionDoc(db), {
         nextSeq: 11,
@@ -361,7 +391,7 @@ describe('the auction doc bump a bidder is allowed alongside a bid', () => {
 
   /** Without this bound a supplier could stall the auction indefinitely. */
   it('refuses a clock bump beyond that bound', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertFails(
       updateDoc(auctionDoc(db), {
         nextSeq: 11,
@@ -372,182 +402,211 @@ describe('the auction doc bump a bidder is allowed alongside a bid', () => {
 
   /** And without this one, a supplier could end the auction for everyone. */
   it('refuses shortening the clock', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertFails(updateDoc(auctionDoc(db), { nextSeq: 11, auctionLength: 0 }));
   });
 
   it('refuses touching any other field', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertFails(updateDoc(auctionDoc(db), { nextSeq: 11, showResults: true }));
-    await assertFails(updateDoc(auctionDoc(db), { nextSeq: 11, ownerUid: ALICE_UID }));
+    await assertFails(updateDoc(auctionDoc(db), { nextSeq: 11, ownerUid: ALICE }));
     await assertFails(updateDoc(auctionDoc(db), { nextSeq: 11, config: { ...CONFIG, lastCallBidders: 12 } }));
   });
 
   it('refuses the bump from a stranger with no claim', async () => {
-    const db = as(STRANGER_UID);
+    const db = as(STRANGER);
     await assertFails(updateDoc(auctionDoc(db), { nextSeq: 11 }));
   });
 
   it('refuses the owner rewriting config once the auction has started', async () => {
-    const db = as(OWNER_UID);
+    const db = as(OWNER);
     await assertFails(
       updateDoc(auctionDoc(db), { config: { ...CONFIG, lastCallBidders: 12 } }),
     );
   });
 
   it('refuses anyone deleting the auction', async () => {
-    await assertFails(deleteDoc(doc(as(OWNER_UID), 'auctions', AUCTION)));
+    await assertFails(deleteDoc(doc(as(OWNER), 'auctions', AUCTION)));
   });
 });
 
-describe('claiming an invited slot is write-once', () => {
+describe('a seat is the whole of the access model', () => {
+  const seatDoc = (db: ReturnType<typeof as>, email: string) =>
+    doc(db, 'auctions', AUCTION, 'seats', email);
+
+  /**
+   * The bug this whole change exists to fix. Under the old model a slot was
+   * bound to the first browser that opened its invite link, so a supplier who
+   * cleared their cookies or reached for a second laptop mid-auction was locked
+   * out with no way back in. Their address is their seat now, so they simply
+   * sign in again.
+   */
+  it('lets a supplier bid from a second device under the same address', async () => {
+    await assertSucceeds(setDoc(eventRef(as(ALICE_ELSEWHERE), 10), bid()));
+  });
+
+  /**
+   * The check that makes the address trustworthy at all. Without it, any
+   * sign-in method that lets a caller *assert* an address would hand them
+   * whichever seat they named.
+   */
+  it('refuses a token carrying an unverified address', async () => {
+    await assertFails(setDoc(eventRef(as(ALICE_UNVERIFIED), 10), bid()));
+    await assertFails(getDoc(doc(as(ALICE_UNVERIFIED), 'auctions', AUCTION, 'identities', ALICE_KEY)));
+  });
+
+  /** Anonymous sessions were the old model's currency; they buy nothing now. */
+  it('refuses a signed-in session with no address at all', async () => {
+    await assertFails(setDoc(eventRef(as(ANONYMOUS), 10), bid()));
+    await assertFails(updateDoc(doc(as(ANONYMOUS), 'auctions', AUCTION), { nextSeq: 11 }));
+  });
+
+  /**
+   * Revocation has to bite immediately, on whatever device the person is
+   * already sitting in front of — an auctioneer removing someone mid-auction
+   * cannot wait for a session to expire.
+   */
+  it('locks someone out the instant their seat is deleted', async () => {
+    await assertSucceeds(setDoc(eventRef(as(ALICE), 10), bid()));
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await deleteDoc(doc(ctx.firestore(), 'auctions', AUCTION, 'seats', ALICE.email!));
+    });
+    await assertFails(setDoc(eventRef(as(ALICE), 11), bid({ seq: 11 })));
+    await assertFails(getDoc(doc(as(ALICE), 'auctions', AUCTION, 'identities', ALICE_KEY)));
+  });
+
+  it('lets only the auctioneer seat and unseat people', async () => {
+    const seat = { publicKey: CAROL_KEY, role: 'bidder', invitedAt: nowSec() };
+    await assertFails(setDoc(seatDoc(as(ALICE), 'interloper@example.com'), seat));
+    await assertFails(setDoc(seatDoc(as(STRANGER), 'interloper@example.com'), seat));
+    await assertSucceeds(setDoc(seatDoc(as(OWNER), 'invited@example.com'), seat));
+
+    await assertFails(deleteDoc(seatDoc(as(ALICE), BOB.email!)));
+    await assertSucceeds(deleteDoc(seatDoc(as(OWNER), CAROL.email!)));
+  });
+
+  /** The escalation to beat: seat yourself, or promote the seat you hold. */
+  it('refuses seating yourself, at any role', async () => {
+    const db = as(STRANGER);
+    for (const role of ['owner', 'bidder', 'viewer']) {
+      await assertFails(
+        setDoc(seatDoc(db, STRANGER.email!), { publicKey: CAROL_KEY, role, invitedAt: nowSec() }),
+      );
+    }
+  });
+
+  it('refuses a seat carrying an unrecognised role or extra fields', async () => {
+    const db = as(OWNER);
+    await assertFails(
+      setDoc(seatDoc(db, 'x@example.com'), { publicKey: CAROL_KEY, role: 'superuser', invitedAt: nowSec() }),
+    );
+    await assertFails(
+      setDoc(seatDoc(db, 'y@example.com'), {
+        publicKey: CAROL_KEY,
+        role: 'bidder',
+        invitedAt: nowSec(),
+        somethingElse: true,
+      }),
+    );
+  });
+
+  /**
+   * The seat holder stamps their own arrival so the roster can show who has
+   * actually got in — and that is the *only* thing they may write. A supplier
+   * who could edit their own seat could promote themselves to auctioneer.
+   */
+  it('lets a seat holder stamp their sign-in and nothing else', async () => {
+    const db = as(CAROL);
+    await assertSucceeds(
+      updateDoc(seatDoc(db, CAROL.email!), { claimedUid: CAROL.uid, claimedAt: nowSec() }),
+    );
+    await assertFails(updateDoc(seatDoc(db, CAROL.email!), { role: 'owner' }));
+    await assertFails(updateDoc(seatDoc(db, CAROL.email!), { publicKey: OWNER_KEY }));
+    await assertFails(
+      updateDoc(seatDoc(db, CAROL.email!), { claimedUid: CAROL.uid, claimedAt: nowSec(), role: 'owner' }),
+    );
+  });
+
+  it('refuses stamping a seat as somebody else\'s uid, or a seat not your own', async () => {
+    await assertFails(
+      updateDoc(seatDoc(as(CAROL), CAROL.email!), { claimedUid: OWNER.uid, claimedAt: nowSec() }),
+    );
+    await assertFails(
+      updateDoc(seatDoc(as(STRANGER), CAROL.email!), { claimedUid: STRANGER.uid, claimedAt: nowSec() }),
+    );
+  });
+
+  /**
+   * A seat maps an address to a supplier, which is exactly the mapping the
+   * auction exists to hide. It is as sensitive as an identity and scoped the
+   * same way.
+   */
+  it('refuses a supplier reading or listing anyone else\'s seat', async () => {
+    const db = as(ALICE);
+    await assertFails(getDoc(seatDoc(db, BOB.email!)));
+    await assertFails(getDocs(collection(db, 'auctions', AUCTION, 'seats')));
+    await assertSucceeds(getDoc(seatDoc(db, ALICE.email!)));
+  });
+
+  /**
+   * Deliberately readable by the address itself rather than by seat holders:
+   * someone whose access was revoked still has to be able to establish that
+   * fact, rather than seeing an unexplained permission error.
+   */
+  it('lets a revoked or never-invited address read its own (missing) seat', async () => {
+    await assertSucceeds(getDoc(seatDoc(as(STRANGER), STRANGER.email!)));
+  });
+
+  it('lets the auctioneer read the whole roster of seats', async () => {
+    await assertSucceeds(getDocs(collection(as(OWNER), 'auctions', AUCTION, 'seats')));
+  });
+
+  /** A co-auctioneer holds the role through their seat, not through ownerUid. */
+  it('treats a seated owner as an auctioneer', async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await setDoc(doc(ctx.firestore(), 'auctions', AUCTION, 'seats', 'deputy@example.com'), {
+        publicKey: OWNER_KEY,
+        role: 'owner',
+        invitedAt: nowSec(),
+      });
+    });
+    const deputy = as({ uid: 'uid-deputy', email: 'deputy@example.com' });
+    await assertSucceeds(setDoc(eventRef(deputy, 10), adminEvent()));
+  });
+});
+
+describe('the public roster slots', () => {
   const userDoc = (db: ReturnType<typeof as>, key: string) =>
     doc(db, 'auctions', AUCTION, 'users', key);
 
-  it('lets a new browser claim the unclaimed slot with a matching invite', async () => {
-    const db = as(STRANGER_UID);
-    await assertSucceeds(
-      updateDoc(userDoc(db, CAROL_KEY), {
-        claimUid: STRANGER_UID,
-        claimInviteId: 'invite-' + CAROL_KEY,
-      }),
-    );
-  });
-
-  it('refuses claiming a slot that is already bound to someone else', async () => {
-    const db = as(STRANGER_UID);
-    await assertFails(
-      updateDoc(userDoc(db, ALICE_KEY), {
-        claimUid: STRANGER_UID,
-        claimInviteId: 'invite-' + ALICE_KEY,
-      }),
-    );
-  });
-
-  /** An invite is a capability for one specific slot, not a generic key. */
-  it('refuses an invite that belongs to a different slot', async () => {
-    const db = as(STRANGER_UID);
-    await assertFails(
-      updateDoc(userDoc(db, CAROL_KEY), {
-        claimUid: STRANGER_UID,
-        claimInviteId: 'invite-' + BOB_KEY,
-      }),
-    );
-  });
-
-  it('refuses a claim with a fabricated invite id', async () => {
-    const db = as(STRANGER_UID);
-    await assertFails(
-      updateDoc(userDoc(db, CAROL_KEY), { claimUid: STRANGER_UID, claimInviteId: 'made-up' }),
-    );
-  });
-
-  it('refuses binding a slot to a uid other than your own', async () => {
-    const db = as(STRANGER_UID);
-    await assertFails(
-      updateDoc(userDoc(db, CAROL_KEY), {
-        claimUid: BOB_UID,
-        claimInviteId: 'invite-' + CAROL_KEY,
-      }),
-    );
-  });
-
-  it('refuses smuggling a role change through the claim', async () => {
-    const db = as(STRANGER_UID);
-    await assertFails(
-      updateDoc(userDoc(db, CAROL_KEY), {
-        claimUid: STRANGER_UID,
-        claimInviteId: 'invite-' + CAROL_KEY,
-        role: 'owner',
-      }),
-    );
-  });
-
   it('refuses a non-owner creating a participant slot outright', async () => {
-    const db = as(STRANGER_UID);
     await assertFails(
-      setDoc(userDoc(db, 'pk-selfmade'), {
+      setDoc(userDoc(as(STRANGER), 'pk-selfmade'), {
         publicKey: 'pk-selfmade',
         role: 'bidder',
-        name: 'Interloper',
-        claimUid: null,
-        claimInviteId: null,
+        label: 'Supplier Z',
+        colorIndex: 0,
       }),
     );
   });
-});
 
-describe('the uid -> role claims mirror', () => {
-  const claimDoc = (db: ReturnType<typeof as>, uid: string) =>
-    doc(db, 'auctions', AUCTION, 'claims', uid);
-
-  it('refuses a claim doc whose user doc does not name that uid', async () => {
-    const db = as(STRANGER_UID);
-    await assertFails(setDoc(claimDoc(db, STRANGER_UID), { publicKey: CAROL_KEY, role: 'bidder' }));
-  });
-
-  /** A fresh uid, so this is the uid check failing and not the create-once one. */
-  it('refuses writing a claim doc under another uid', async () => {
-    const db = as(STRANGER_UID);
-    await assertFails(setDoc(claimDoc(db, 'uid-nobody'), { publicKey: CAROL_KEY, role: 'bidder' }));
-  });
-
-  /** Role escalation: claim the slot legitimately, then declare yourself owner. */
-  it('refuses a role that disagrees with the user doc', async () => {
-    const db = as(STRANGER_UID);
-    await assertSucceeds(
-      updateDoc(doc(db, 'auctions', AUCTION, 'users', CAROL_KEY), {
-        claimUid: STRANGER_UID,
-        claimInviteId: 'invite-' + CAROL_KEY,
-      }),
-    );
-    await assertFails(setDoc(claimDoc(db, STRANGER_UID), { publicKey: CAROL_KEY, role: 'owner' }));
-    await assertSucceeds(setDoc(claimDoc(db, STRANGER_UID), { publicKey: CAROL_KEY, role: 'bidder' }));
-  });
-
-  it('refuses overwriting an existing claim', async () => {
-    const db = as(ALICE_UID);
-    await assertFails(updateDoc(claimDoc(db, ALICE_UID), { role: 'owner' }));
-  });
-
-  it('refuses reading someone else\'s claim', async () => {
-    const db = as(ALICE_UID);
-    await assertFails(getDoc(claimDoc(db, BOB_UID)));
-    await assertSucceeds(getDoc(claimDoc(db, ALICE_UID)));
+  /** Immutable: who occupies a slot is a property of the seat, not of this doc. */
+  it('refuses rewriting or deleting a slot, even by the auctioneer', async () => {
+    const db = as(OWNER);
+    await assertFails(updateDoc(userDoc(db, ALICE_KEY), { role: 'owner' }));
+    await assertFails(deleteDoc(userDoc(db, ALICE_KEY)));
   });
 });
 
 describe('collections that must never be enumerable', () => {
-  /**
-   * Invite ids are bearer secrets, so listing the collection would hand out
-   * every slot at once. Same for the auction collection and the roster.
-   */
-  it('refuses listing invites, while allowing a direct get', async () => {
-    const db = as(ALICE_UID);
-    await assertFails(getDocs(collection(db, 'auctions', AUCTION, 'invites')));
-    await assertSucceeds(getDoc(doc(db, 'auctions', AUCTION, 'invites', 'invite-' + CAROL_KEY)));
-  });
-
   it('refuses listing the participant roster', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertFails(getDocs(collection(db, 'auctions', AUCTION, 'users')));
   });
 
   it('refuses enumerating auctions', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertFails(getDocs(collection(db, 'auctions')));
-  });
-
-  it('refuses a non-owner minting an invite', async () => {
-    const db = as(ALICE_UID);
-    await assertFails(setDoc(doc(db, 'auctions', AUCTION, 'invites', 'forged'), { publicKey: CAROL_KEY }));
-  });
-
-  it('refuses rewriting or deleting an existing invite', async () => {
-    const db = as(OWNER_UID);
-    const ref = doc(db, 'auctions', AUCTION, 'invites', 'invite-' + CAROL_KEY);
-    await assertFails(updateDoc(ref, { publicKey: ALICE_KEY }));
-    await assertFails(deleteDoc(ref));
   });
 });
 
@@ -565,7 +624,7 @@ describe('supplier anonymity', () => {
     doc(db, 'auctions', AUCTION, 'users', publicKey);
 
   it('refuses a supplier reading a rival identity, before or after results', async () => {
-    const db = as(ALICE_UID);
+    const db = as(ALICE);
     await assertFails(getDoc(identityDoc(db, BOB_KEY)));
     await assertFails(getDoc(identityDoc(db, CAROL_KEY)));
 
@@ -577,16 +636,16 @@ describe('supplier anonymity', () => {
   });
 
   it('refuses a supplier enumerating the identities collection', async () => {
-    await assertFails(getDocs(collection(as(ALICE_UID), 'auctions', AUCTION, 'identities')));
-    await assertFails(getDocs(collection(as(STRANGER_UID), 'auctions', AUCTION, 'identities')));
+    await assertFails(getDocs(collection(as(ALICE), 'auctions', AUCTION, 'identities')));
+    await assertFails(getDocs(collection(as(STRANGER), 'auctions', AUCTION, 'identities')));
   });
 
   it('lets a supplier read their own identity', async () => {
-    await assertSucceeds(getDoc(identityDoc(as(ALICE_UID), ALICE_KEY)));
+    await assertSucceeds(getDoc(identityDoc(as(ALICE), ALICE_KEY)));
   });
 
   it('lets the auctioneer and the buying-side observer read every identity', async () => {
-    for (const uid of [OWNER_UID, DAVE_UID]) {
+    for (const uid of [OWNER, DAVE]) {
       const db = as(uid);
       await assertSucceeds(getDoc(identityDoc(db, ALICE_KEY)));
       await assertSucceeds(getDocs(collection(db, 'auctions', AUCTION, 'identities')));
@@ -594,19 +653,19 @@ describe('supplier anonymity', () => {
   });
 
   it('refuses a stranger with the auction id reading any identity', async () => {
-    await assertFails(getDoc(identityDoc(as(STRANGER_UID), ALICE_KEY)));
+    await assertFails(getDoc(identityDoc(as(STRANGER), ALICE_KEY)));
     await assertFails(getDoc(identityDoc(as(null), ALICE_KEY)));
   });
 
   it('refuses anyone but the auctioneer creating an identity, and any rewrite', async () => {
-    await assertFails(setDoc(identityDoc(as(ALICE_UID), 'pk-new'), { name: 'Forged' }));
-    await assertSucceeds(setDoc(identityDoc(as(OWNER_UID), 'pk-new'), { name: 'Legit' }));
-    await assertFails(updateDoc(identityDoc(as(OWNER_UID), ALICE_KEY), { name: 'Renamed' }));
-    await assertFails(deleteDoc(identityDoc(as(OWNER_UID), ALICE_KEY)));
+    await assertFails(setDoc(identityDoc(as(ALICE), 'pk-new'), { name: 'Forged' }));
+    await assertSucceeds(setDoc(identityDoc(as(OWNER), 'pk-new'), { name: 'Legit' }));
+    await assertFails(updateDoc(identityDoc(as(OWNER), ALICE_KEY), { name: 'Renamed' }));
+    await assertFails(deleteDoc(identityDoc(as(OWNER), ALICE_KEY)));
   });
 
   it('leaves no name in the slots a supplier *can* read', async () => {
-    const snap = await getDoc(slotDoc(as(ALICE_UID), BOB_KEY));
+    const snap = await getDoc(slotDoc(as(ALICE), BOB_KEY));
     expect(snap.data()).toMatchObject({ role: 'bidder', label: 'Supplier B' });
     expect(snap.data()!.name).toBeUndefined();
     expect(snap.data()!.email).toBeUndefined();
@@ -632,7 +691,7 @@ describe('unauthenticated clients', () => {
  */
 describe('known limitation: the log is readable by any signed-in client', () => {
   it('lets a stranger with the auction id read every bid', async () => {
-    const db = as(STRANGER_UID);
+    const db = as(STRANGER);
     const snap = await getDocs(collection(db, 'auctions', AUCTION, 'events'));
     expect(snap.empty).toBe(false);
   });

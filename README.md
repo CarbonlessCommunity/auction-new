@@ -21,10 +21,15 @@ running a real auction.
 npm install && npm run dev
 ```
 
-Open the printed URL, fill in the auction settings, and you land on the board as
-the auctioneer. The People panel gives you one invite link per participant: open
-one in a private window and you can drive both sides of a live auction on one
-machine.
+Open the printed URL and fill in the auction settings. You confirm your email
+address once — a sign-in link arrives, and clicking it creates the auction and
+lands you on the board as the auctioneer. The People panel is where you invite
+each supplier and client by email.
+
+To drive both sides on one machine, run against the emulators
+(`npm run dev:emulator`), where no mail is actually sent: the sign-in links are
+served by the Auth emulator at
+`http://127.0.0.1:9099/emulator/v1/projects/<project-id>/oobCodes`.
 
 Then: **Add contract term** → **Start auction** → place bids as the suppliers →
 watch the clock cross into Extended Time and Last Call → **Release results to
@@ -57,9 +62,12 @@ themselves, so `brew install openjdk` is the only setup.
 
 Firebase config lives in [`src/client/firebase.ts`](src/client/firebase.ts) (a web
 API key is not a secret — access is governed entirely by
-[`firestore.rules`](firestore.rules)). The project needs **Anonymous** sign-in
-enabled under Authentication → Sign-in method; every participant is an anonymous
-uid bound to one invite.
+[`firestore.rules`](firestore.rules)). The project needs **Email link
+(passwordless sign-in)** enabled under Authentication → Sign-in method — open
+the *Email/Password* provider and switch on "Email link" — and whatever domain
+you serve from listed under Authentication → Settings → Authorized domains.
+Every participant signs in with their own address; there is no other credential
+in the system.
 
 ## How it works
 
@@ -111,11 +119,32 @@ that go unnoticed long enough to distort the board.
 
 The UI renames each role rather than showing internal vocabulary.
 
-The auctioneer creates a slot per participant and gets a link carrying an invite
-id. The first browser to open that link binds its anonymous uid to the slot,
-write-once; after that the link is spent. A `claims/{uid}` document mirrors the
-binding so the security rules can resolve "who is this uid" with a single read,
-since rules cannot run queries.
+**A participant's identity is their verified email address**, established by
+Firebase's passwordless email-link sign-in. The auctioneer invites an address;
+that writes a *seat* at `auctions/{id}/seats/{email}` naming the slot and role it
+grants. A signed-in client's token carries the address, so `firestore.rules`
+resolves "who is this" by reading that one document — no query, and no secret in
+a URL.
+
+Consequences worth stating plainly, because they are the point:
+
+- **Nothing in a link grants access.** A forwarded invitation signs the
+  forwarder in as themselves, which gets them nowhere.
+- **A supplier can sign in again, on any device, as often as they like.** Losing
+  a session mid-auction is a nuisance rather than a catastrophe; "send link"
+  from the roster is the whole remedy.
+- **Revoking is immediate.** Deleting the seat cuts access off on whatever
+  device the person is already using, because every rule resolves through it.
+
+The auctioneer's **People** panel is the operational view of this: every
+participant, their address, whether they have actually signed in yet, and
+buttons to resend a link, correct a mistyped address, or remove access.
+
+(An earlier design bound a slot to the first browser that opened a bearer invite
+link. It could not tell a supplier from whoever they forwarded the link to, and
+a supplier who cleared their cookies was locked out with no recovery path at
+all. Both problems are structural to bearer links, which is why this replaced
+them rather than patching them.)
 
 ### Anonymity
 
@@ -139,11 +168,14 @@ This is structural, not a render-time filter:
   The log is world-readable to anyone signed in; there is simply nothing in it
   to read.
 - `auctions/{id}/users/{publicKey}` — readable by any signed-in client, because
-  the invite handshake needs it — carries only role, label and colour.
+  a viewer resolves their own slot there — carries only role, label and colour.
 - Names and emails live in `auctions/{id}/identities/{publicKey}`, and
   `firestore.rules` scopes that collection to the auctioneer, observers on the
   buying side, and the participant themselves. A supplier reading Firestore by
   hand gets exactly as far as one using the UI.
+- The seat table is scoped the same way. `{address → supplier}` is precisely the
+  mapping the auction exists to hide, so a supplier may read only their own seat
+  and only the auctioneer may enumerate them.
 
 The auctioneer's screen is the only one where a price and a firm appear
 together; the client's shows the same. Both CSV exports carry the anonymous
@@ -213,7 +245,9 @@ reads:
 - events are append-only and gapless — no overwrite, no delete, no seq gaps;
 - a supplier's paired clock bump is bounded, so it can neither end the auction
   early nor stall it;
-- a slot can only ever be claimed once, by a matching invite.
+- only the auctioneer can seat or unseat anyone, a seat holder can change
+  nothing about their own seat but the sign-in stamp, and an address that was
+  never verified resolves to no seat at all.
 
 What they cannot enforce, and what is therefore **cosmetic rather than secret**:
 
@@ -245,7 +279,7 @@ as explicit tests so a future change that closes one is noticed.
 | Runtime | Python 2.7 on App Engine | Static TypeScript SPA, no server to run |
 | Realtime | 2-second polling | Firestore snapshot listeners |
 | Storage | `pickle`d validator state in the datastore | Firestore event log; state is always re-derivable |
-| Auth | Private key in the URL | Anonymous Firebase uid bound write-once to an invite |
+| Auth | Private key in the URL | Firebase email-link sign-in; access keyed to the verified address |
 | Rules | Hardcoded constants in `validation.py` | Per-auction config, editable before start |
 | Direction | Reverse only | Reverse or forward |
 | Input | `window.prompt` / `window.confirm` | Inline forms, live validation |
@@ -257,8 +291,9 @@ as explicit tests so a future change that closes one is noticed.
 
 ```
 src/shared/     types, rules, config, schemas, aggregate, validation
-src/client/     firebase, connection (transactional append + listeners),
-                views (create, auction board, chart), export, format
+src/client/     firebase, auth (email-link sign-in), connection (transactional
+                append + listeners + seats), views (sign-in, create, auction
+                board, chart), export, format
 firestore.rules the enforcement boundary — read the header comment
 tests/          domain rules, bid comparison, validation
 tests/rules/    security rules, against the emulator
@@ -266,8 +301,10 @@ tests/rules/    security rules, against the emulator
 
 ## Notes
 
-- **Email invitations are deliberately not built.** Invite links are shown in the
-  auctioneer's People panel to copy out by hand.
+- **Invitations are sent by Firebase Auth**, not by the app: the "email" a
+  participant receives is the sign-in link itself. There is no separate
+  invitation message, and nothing to compose. The auctioneer's People panel
+  triggers and re-triggers them.
 - **Clock skew** is not corrected: countdowns come from each browser's own
   `Date.now()`, so a badly-set machine will disagree by its own offset. The
   security rules allow a 5-second grace window on the deadline for this reason.

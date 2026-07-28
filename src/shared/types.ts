@@ -67,7 +67,13 @@ export interface AddUserInput {
   type: 'addUser';
   name: string;
   role: Role;
-  email?: string;
+  /**
+   * Required: the address is the participant's identity. It is what the seat
+   * is keyed by, what the sign-in link is sent to, and what
+   * `firestore.rules` checks a token against — there is no other way to let
+   * someone in. Like `name`, it is stripped from the event before the log.
+   */
+  email: string;
 }
 
 export interface AddLotInput {

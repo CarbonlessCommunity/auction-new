@@ -1,4 +1,6 @@
-import { Connection } from '../connection';
+import { auctionUrl, Connection, type RosterEntry } from '../connection';
+import { signOutNow } from '../auth';
+import { renderSignIn } from './signin';
 import type { AuctionAggregate, StoredLot, StoredUser } from '../../shared/aggregate';
 import type { AuctionPhase, BidDirection, Role } from '../../shared/types';
 import { MAX_BIDDERS, MAX_LOTS } from '../../shared/rules';
@@ -53,7 +55,8 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
   let panel: Panel = null;
   let phaseKey = '';
   let rulesDismissed = false;
-  let inviteLinks = new Map<string, string>();
+  /** The auctioneer's roster, fetched on demand — see `refreshRoster`. */
+  let roster: RosterEntry[] | null = null;
 
   const isOwner = () => connection.you?.role === 'owner';
   const canBid = () => connection.you?.role === 'bidder';
@@ -109,7 +112,7 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       buttons.push(`<button class="primary" data-act="release">Release results to everyone</button>`);
     }
 
-    buttons.push('<button data-act="panel-person">Add participant</button>');
+    buttons.push('<button data-act="panel-person">Invite participant</button>');
     buttons.push(`<button data-act="panel-people">People (${agg.users.size})</button>`);
     buttons.push('<button data-act="export-results">Download results (CSV)</button>');
     buttons.push('<button data-act="export-bids">Download bid log (CSV)</button>');
@@ -149,20 +152,23 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     if (panel === 'person') {
       el.panel.innerHTML = `
         <form class="card panel" data-form="person">
-          <h3>Add a participant</h3>
+          <h3>Invite a participant</h3>
           <div class="row">
-            <input class="grow" name="name" data-k="person-name" placeholder="Name" required />
+            <input class="grow" name="name" data-k="person-name" placeholder="Firm or person" required />
+            <input class="grow" name="email" type="email" data-k="person-email"
+                   placeholder="them@theirfirm.com" required />
             <select name="role" style="width:auto">
               <option value="bidder">${roleLabel('bidder')}</option>
               <option value="viewer">${roleLabel('viewer')}</option>
               <option value="owner">${roleLabel('owner')}</option>
             </select>
-            <button class="primary">Add</button>
+            <button class="primary">Invite</button>
           </div>
           <p class="muted" style="font-size:0.85rem;margin:0.6rem 0 0">
-            You will get a private invite link to send them. Each supplier is
+            They get a sign-in link at that address, and that address is the only
+            way in — a forwarded link signs nobody else in. Each supplier is
             assigned a colour as you add them, and that colour is all the other
-            suppliers ever see of them — names appear on your screen and the
+            suppliers ever see of them: names appear on your screen and the
             client's, never on a rival's.
           </p>
         </form>`;
@@ -170,35 +176,15 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     }
 
     if (panel === 'people') {
-      const rows = [...agg.users.values()]
-        .map((user) => {
-          const link = inviteLinks.get(user.publicKey);
-          const swatch =
-            user.role === 'bidder'
-              ? `<span class="swatch" style="background:${bidderColor(user.colorIndex)}"></span>`
-              : '';
-          return `
-            <li>
-              <span class="grow">
-                ${swatch}${escapeHtml(user.name)}
-                <span class="role">${roleLabel(user.role)}</span>
-              </span>
-              <button class="link" data-act="invite" data-key="${user.publicKey}">
-                ${link ? 'new link' : 'get link'}
-              </button>
-              ${link ? `<button class="link" data-act="copy" data-link="${escapeHtml(link)}">copy</button>` : ''}
-            </li>
-            ${link ? `<li class="invite">${escapeHtml(link)}</li>` : ''}`;
-        })
-        .join('');
-
       el.panel.innerHTML = `
         <div class="card panel">
           <h3>People</h3>
-          <ul class="people">${rows}</ul>
+          ${roster === null ? '<p class="muted">Loading…</p>' : rosterTable(roster)}
           <p class="hint">
-            A supplier's colour is the only thing the other suppliers see of them.
-            Names appear here, on the client's screen, and in the CSV downloads.
+            Everyone here signs in with their own email address, and sees only
+            what their role allows. A supplier's colour is the only thing the
+            other suppliers see of them — names and addresses appear on this
+            screen, on the client's, and in the CSV downloads.
           </p>
         </div>`;
       return;
@@ -233,6 +219,58 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
           <button class="primary">Save rules</button>
         </form>`;
     }
+  }
+
+  /**
+   * The auctioneer's roster: one row per participant, saying who they are, what
+   * they can see, and — the question that actually matters in the ten minutes
+   * before an auction opens — whether they have managed to get in yet.
+   */
+  function rosterTable(entries: RosterEntry[]): string {
+    const rows = entries
+      .map((entry) => {
+        const swatch =
+          entry.role === 'bidder'
+            ? `<span class="swatch" style="background:${bidderColor(entry.colorIndex)}"></span>`
+            : '';
+        const status = entry.email === null
+          ? '<span class="status is-revoked">access removed</span>'
+          : entry.signedInAt !== null
+            ? '<span class="status is-in">signed in</span>'
+            : '<span class="status is-waiting">not signed in yet</span>';
+
+        const actions = entry.email === null
+          ? `<button class="link" data-act="reassign" data-key="${entry.publicKey}" data-email="">invite someone</button>`
+          : `<button class="link" data-act="resend" data-email="${escapeHtml(entry.email)}">send link</button>
+             <button class="link" data-act="reassign" data-key="${entry.publicKey}" data-email="${escapeHtml(entry.email)}">change email</button>
+             ${
+               entry.isYou
+                 ? ''
+                 : `<button class="link danger" data-act="revoke" data-email="${escapeHtml(entry.email)}" data-name="${escapeHtml(entry.name)}">remove</button>`
+             }`;
+
+        return `
+          <li class="roster-row">
+            <span class="grow">
+              ${swatch}<strong>${escapeHtml(entry.name)}</strong>
+              <span class="role">${roleLabel(entry.role)}</span>
+              ${entry.role === 'bidder' ? `<span class="role">seen as ${escapeHtml(entry.label)}</span>` : ''}
+              <br /><span class="muted">${escapeHtml(entry.email ?? 'no address')}</span>
+            </span>
+            ${status}
+            <span class="roster-actions">${actions}</span>
+          </li>`;
+      })
+      .join('');
+
+    return `<ul class="people">${rows}</ul>`;
+  }
+
+  /** Re-reads the roster from Firestore, then repaints whatever is on screen. */
+  async function refreshRoster(): Promise<void> {
+    if (!isOwner()) return;
+    roster = await connection.roster();
+    update();
   }
 
   function renderRules(agg: AuctionAggregate): void {
@@ -375,9 +413,23 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
   }
 
   function update(): void {
+    // Nobody is signed in: this is a sign-in problem, not a refusal, and the
+    // remedy is a form rather than an apology.
+    if (connection.needsSignIn) {
+      renderSignIn(root, {
+        continueUrl: auctionUrl(auctionId),
+        heading: 'Sign in to this auction',
+        blurb:
+          'Enter the email address the auctioneer invited. Which screen you get — ' +
+          'auctioneer, supplier or client — follows from who you are, not from the link you were sent.',
+        onSignedIn: () => location.reload(),
+      });
+      return;
+    }
+
     if (connection.authError) {
       el.name.textContent = 'Access denied';
-      el.who.innerHTML = '';
+      el.who.innerHTML = signedInAs();
       el.controls.innerHTML = '';
       el.panel.innerHTML = '';
       el.rules.innerHTML = '';
@@ -395,7 +447,8 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     // indistinguishable, so each one says what it is and what it shows.
     el.who.innerHTML = `
       <span class="me">${escapeHtml(connection.you.name)}</span>
-      <span class="view">${escapeHtml(viewBanner(connection.you.role))}</span>`;
+      <span class="view">${escapeHtml(viewBanner(connection.you.role))}</span>
+      ${signedInAs()}`;
 
     renderClock(agg, phase);
     renderControls(agg, phase);
@@ -428,6 +481,18 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     if (!user) return '';
     if (user.publicKey === yourKey) return `${user.name} (you)`;
     return canBid() ? '' : user.name;
+  }
+
+  /**
+   * The address this browser is acting as. On screen at all times, including on
+   * the access-denied page: "you are signed in as the wrong address" is by far
+   * the most likely reason someone cannot see what they expect, and it is
+   * unguessable unless the app says so.
+   */
+  function signedInAs(): string {
+    if (!connection.email) return '';
+    return `<span class="signed-in">${escapeHtml(connection.email)}
+      <button class="link" data-act="signout">sign out</button></span>`;
   }
 
   /** The one line that tells someone which of the three screens they are on. */
@@ -473,6 +538,15 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       const next = act.slice(6) as Panel;
       panel = panel === next ? null : next;
       update();
+      // The roster is the one panel whose contents live outside the event log,
+      // so opening it is what goes and reads them.
+      if (panel === 'people') void refreshRoster();
+      return;
+    }
+
+    if (act === 'signout') {
+      await signOutNow();
+      location.reload();
       return;
     }
 
@@ -507,21 +581,42 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       return;
     }
 
-    if (act === 'invite') {
-      const key = target.dataset.key!;
-      const result = await connection.createInvite(key);
-      if (result.ok && result.inviteUrl) {
-        inviteLinks.set(key, result.inviteUrl);
-        update();
-      } else {
-        toast(result.error ?? 'Could not create a link.', 'error');
-      }
+    if (act === 'resend') {
+      const email = target.dataset.email!;
+      const result = await connection.sendInvite(email);
+      toast(result.ok ? `Sign-in link sent to ${email}.` : result.error ?? 'Could not send the link.',
+        result.ok ? 'info' : 'error');
       return;
     }
 
-    if (act === 'copy') {
-      await navigator.clipboard.writeText(target.dataset.link!);
-      toast('Invite link copied.');
+    if (act === 'reassign') {
+      const oldEmail = target.dataset.email ?? '';
+      const next = prompt('Which email address should hold this place?', oldEmail);
+      if (!next) return;
+      const result = await connection.reassignSeat(target.dataset.key!, oldEmail, next);
+      if (!result.ok) {
+        toast(result.error ?? 'Could not change the address.', 'error');
+        return;
+      }
+      // Moving a seat only grants access; it does not announce itself. Send the
+      // link too, or the new address has no idea it is expected.
+      await connection.sendInvite(next);
+      toast(`Sign-in link sent to ${next}.`);
+      await refreshRoster();
+      return;
+    }
+
+    if (act === 'revoke') {
+      const email = target.dataset.email!;
+      const name = target.dataset.name!;
+      if (!confirm(`Remove ${name}'s access? They are signed out immediately. Any bids they have already placed stay on the board.`)) return;
+      const result = await connection.revokeSeat(email);
+      if (!result.ok) {
+        toast(result.error ?? 'Could not remove access.', 'error');
+        return;
+      }
+      toast(`${name} can no longer sign in.`);
+      await refreshRoster();
       return;
     }
 
@@ -564,12 +659,23 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
         panel = null;
       });
     } else if (kind === 'person') {
+      const email = String(data.get('email'));
       await submit(
-        { type: 'addUser', name: String(data.get('name')), role: data.get('role') as Role },
-        (result) => {
-          const key = String((result.event as { publicKey?: string } | undefined)?.publicKey ?? '');
-          if (result.inviteUrl) inviteLinks.set(key, result.inviteUrl);
+        {
+          type: 'addUser',
+          name: String(data.get('name')),
+          role: data.get('role') as Role,
+          email,
+        },
+        async () => {
           panel = 'people';
+          // Seating them is what grants access; this is what tells them so.
+          const sent = await connection.sendInvite(email);
+          toast(
+            sent.ok ? `Sign-in link sent to ${email}.` : `Added, but the link could not be sent: ${sent.error}`,
+            sent.ok ? 'info' : 'error',
+          );
+          await refreshRoster();
         },
       );
     } else if (kind === 'rules') {
@@ -596,7 +702,9 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
 
   connection.onChange(() => {
     document.querySelector('.offline')?.remove();
-    if (!connection.connected) {
+    // Someone who is not signed in yet is not "reconnecting" — they are being
+    // asked a question, and a network warning over the top only muddies it.
+    if (!connection.connected && !connection.needsSignIn && !connection.authError) {
       const bar = document.createElement('div');
       bar.className = 'offline';
       bar.textContent = 'Reconnecting…';

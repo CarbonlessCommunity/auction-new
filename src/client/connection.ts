@@ -1,7 +1,9 @@
 import {
   collection,
+  deleteDoc,
   doc,
   getDoc,
+  getDocs,
   onSnapshot,
   orderBy,
   query,
@@ -10,8 +12,9 @@ import {
   setDoc,
   updateDoc,
 } from 'firebase/firestore';
-import { onAuthStateChanged, signInAnonymously, type User } from 'firebase/auth';
-import { auth, db } from './firebase';
+import type { User } from 'firebase/auth';
+import { db } from './firebase';
+import { currentUser, normalizeEmail, sendSignInLink } from './auth';
 import { AuctionAggregate, type Participant } from '../shared/aggregate';
 import { configSchema } from '../shared/config';
 import { totalRunSec } from '../shared/rules';
@@ -23,6 +26,22 @@ export interface ApiResult<T = unknown> {
   ok: boolean;
   error?: string;
   [key: string]: unknown;
+}
+
+/** One row of the auctioneer's roster — see {@link Connection.roster}. */
+export interface RosterEntry {
+  publicKey: string;
+  /** The real firm/person name. Never leaves an auctioneer's or observer's screen. */
+  name: string;
+  /** What every other supplier sees instead: "Supplier B". */
+  label: string;
+  role: Role;
+  colorIndex: number;
+  /** The invited address, or null if the seat has been revoked. */
+  email: string | null;
+  /** When they first signed in, or null if they never have. */
+  signedInAt: number | null;
+  isYou: boolean;
 }
 
 /**
@@ -44,19 +63,35 @@ interface AuctionDocData {
 }
 
 /**
- * `auctions/{id}/users/{publicKey}` — the claimable slot. Deliberately holds
- * *no* identifying data: any signed-in client can read it (the claim handshake
- * needs to, before it has a claim of its own), so a supplier's firm cannot live
- * here. Only the label and colour a rival is allowed to see.
+ * `auctions/{id}/users/{publicKey}` — the public roster slot. Deliberately
+ * holds *no* identifying data: any signed-in client can read it (a viewer
+ * resolves their own slot here before anything else is known about them), so a
+ * supplier's firm cannot live here. Only the label and colour a rival is
+ * allowed to see. Who occupies the slot is a property of the seat, below.
  */
 interface UserDocData {
   publicKey: string;
   role: Role;
   label: string;
   colorIndex: number;
-  /** Firebase anon-auth uid bound to this slot, or null until an invite is claimed. */
-  claimUid: string | null;
-  claimInviteId: string | null;
+}
+
+/**
+ * `auctions/{id}/seats/{email}` — the access-control table, keyed by the
+ * address the auctioneer invited. A signed-in client's verified email is
+ * matched straight against this document id, which is what lets
+ * `firestore.rules` decide a caller's role without any secret in a URL.
+ *
+ * `claimedUid`/`claimedAt` are stamped by the seat holder on their first
+ * successful sign-in, purely so the auctioneer's roster can tell "invited"
+ * apart from "has actually got in".
+ */
+interface SeatDocData {
+  publicKey: string;
+  role: Role;
+  invitedAt: number;
+  claimedUid?: string;
+  claimedAt?: number;
 }
 
 /**
@@ -77,42 +112,39 @@ const eventRef = (id: string, seq: number) => doc(db, 'auctions', id, 'events', 
 const userRef = (id: string, publicKey: string) => doc(db, 'auctions', id, 'users', publicKey);
 const identitiesCol = (id: string) => collection(db, 'auctions', id, 'identities');
 const identityRef = (id: string, publicKey: string) => doc(db, 'auctions', id, 'identities', publicKey);
-const inviteRef = (id: string, inviteId: string) => doc(db, 'auctions', id, 'invites', inviteId);
-/**
- * `auctions/{id}/claims/{uid}` mirrors "which slot does this Firebase Auth uid
- * own" — keyed by uid so `firestore.rules` can resolve a writer's role with a
- * single `get()` instead of a query (Firestore rules cannot run
- * `where(claimUid==...)` queries the way `resolveYou` below used to).
- * Create-only, one per uid, so it also enforces first-claim-wins.
- */
-const claimRef = (id: string, uid: string) => doc(db, 'auctions', id, 'claims', uid);
+const seatsCol = (id: string) => collection(db, 'auctions', id, 'seats');
+const seatRef = (id: string, email: string) => doc(db, 'auctions', id, 'seats', normalizeEmail(email));
 
-/** 128 bits of randomness, hex-encoded — used for both auction ids and invite capabilities. */
-function randomId(bytes = 16): string {
+/** Random bytes, hex-encoded — used for unguessable auction ids. */
+function randomId(bytes: number): string {
   const arr = new Uint8Array(bytes);
   crypto.getRandomValues(arr);
   return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export function inviteUrl(auctionId: string, inviteId: string): string {
-  return `${location.origin}/a/${auctionId}?invite=${inviteId}`;
+/** The page a sign-in link should return someone to. */
+export function auctionUrl(auctionId: string): string {
+  return `${location.origin}/a/${auctionId}`;
 }
 
-/** Resolves once an anonymous Firebase Auth session exists, signing in if needed. */
-function ensureAuth(): Promise<User> {
-  return new Promise((resolve, reject) => {
-    const unsubscribe = onAuthStateChanged(
-      auth,
-      (user) => {
-        if (user) {
-          unsubscribe();
-          resolve(user);
-        }
-      },
-      reject,
-    );
-    if (!auth.currentUser) signInAnonymously(auth).catch(reject);
-  });
+/** Raised when an operation needs a signed-in, email-verified user and has none. */
+export class NotSignedInError extends Error {
+  constructor() {
+    super('Sign in with your email address to continue.');
+    this.name = 'NotSignedInError';
+  }
+}
+
+/**
+ * The signed-in user, insisting on a *verified* address. Everything downstream
+ * — the seat lookup, every rule in `firestore.rules` — keys off that address,
+ * so a session without one cannot be allowed to proceed as if it had a claim
+ * to anything.
+ */
+async function requireVerifiedUser(): Promise<User & { email: string }> {
+  const user = await currentUser();
+  if (!user || !user.email || !user.emailVerified) throw new NotSignedInError();
+  return user as User & { email: string };
 }
 
 /** Fields to mirror onto `auctions/{id}` alongside a newly appended event, for rules' benefit. */
@@ -135,7 +167,6 @@ function mirrorUpdate(event: AuctionEvent): Record<string, unknown> {
 export interface CreateAuctionInput {
   name: string;
   ownerName: string;
-  email?: string;
   config: AuctionConfig;
   /** Contract terms to open the board with, e.g. ['12 Months', '24 Months']. */
   lots: string[];
@@ -144,12 +175,16 @@ export interface CreateAuctionInput {
 /**
  * Creates a new auction: the auction doc first (so `ownerUid` exists for
  * `isOwner()` rule checks), then the bootstrap `setName`/`addUser` events and
- * the owner's own (already-claimed) user doc, mirroring what the old
- * `POST /api/auctions` route did with a synthetic system actor.
+ * the owner's own user doc and seat.
+ *
+ * The creator must already be signed in, because the auctioneer is a
+ * participant like any other — their seat is what gets them back into their own
+ * auction from a second device, and what makes "auctioneer" a role someone
+ * holds rather than a browser that happens to remember something.
  */
 export async function createAuction(input: CreateAuctionInput): Promise<ApiResult & { id?: string }> {
   try {
-    const user = await ensureAuth();
+    const user = await requireVerifiedUser();
     const id = randomId(6);
     const aRef = auctionRef(id);
 
@@ -185,7 +220,7 @@ export async function createAuction(input: CreateAuctionInput): Promise<ApiResul
       type: 'addUser',
       name: input.ownerName,
       role: 'owner',
-      ...(input.email ? { email: input.email } : {}),
+      email: user.email,
     };
     const owner = validateInbound(agg, ownerInput, system, Date.now() / 1000, 1);
     if (!owner.ok) throw new Error(owner.error);
@@ -199,14 +234,16 @@ export async function createAuction(input: CreateAuctionInput): Promise<ApiResul
         role: 'owner',
         label: owner.event.label as string,
         colorIndex: owner.event.colorIndex as number,
-        claimUid: user.uid,
-        claimInviteId: null,
       });
-      tx.set(identityRef(id, ownerKey), {
-        name: input.ownerName,
-        ...(input.email ? { email: input.email } : {}),
+      tx.set(identityRef(id, ownerKey), { name: input.ownerName, email: user.email });
+      // Seated under the address they are signed in with. The claim stamp lands
+      // on the next line of the story — they are about to be redirected onto
+      // the auction page, which stamps it like any other arriving participant.
+      tx.set(seatRef(id, user.email), {
+        publicKey: ownerKey,
+        role: 'owner',
+        invitedAt: Date.now() / 1000,
       });
-      tx.set(claimRef(id, user.uid), { publicKey: ownerKey, role: 'owner' });
     });
     agg.apply(owner.event);
 
@@ -244,8 +281,18 @@ export class Connection {
   auction: AuctionMeta | null = null;
   you: UserView | null = null;
   connected = false;
-  /** Set when this browser could not be resolved to a member of this auction. */
+  /** Set when the signed-in address could not be resolved to a seat here. */
   authError: string | null = null;
+  /**
+   * Set when there is no signed-in user at all, so the view knows to show the
+   * sign-in form rather than a refusal. Distinct from `authError`: "we do not
+   * know who you are" and "we know, and you are not on the list" are different
+   * problems with different remedies, and telling them apart is most of what
+   * makes a locked-out supplier fixable in the minute before an auction opens.
+   */
+  needsSignIn = false;
+  /** The address this browser is signed in as, once known. */
+  email: string | null = null;
 
   private uid: string | null = null;
   private auctionData: AuctionDocData | null = null;
@@ -286,7 +333,11 @@ export class Connection {
 
   connect(): void {
     this.init().catch((err) => {
-      this.authError = err instanceof Error ? err.message : 'Could not connect.';
+      if (err instanceof NotSignedInError) {
+        this.needsSignIn = true;
+      } else {
+        this.authError = err instanceof Error ? err.message : 'Could not connect.';
+      }
       this.emit();
     });
   }
@@ -303,18 +354,15 @@ export class Connection {
   }
 
   private async init(): Promise<void> {
-    const user = await ensureAuth();
+    const user = await requireVerifiedUser();
     this.uid = user.uid;
-
-    const invite = new URLSearchParams(location.search).get('invite');
-    if (invite) {
-      await this.claimInvite(invite);
-      history.replaceState(null, '', `/a/${this.auctionId}`);
-    }
+    this.email = user.email;
 
     const you = await this.resolveYou();
     if (!you) {
-      this.authError = 'You do not have access to this auction. Ask the organiser for an invite link.';
+      this.authError =
+        `${user.email} has not been invited to this auction. ` +
+        'Ask the auctioneer to invite that address — or sign out and sign in with the one they used.';
       this.emit();
       return;
     }
@@ -408,37 +456,33 @@ export class Connection {
   }
 
   /**
-   * Claims an invited slot by presenting the capability id from the URL.
-   * Write-once: the first browser to claim a given slot binds it to that
-   * anonymous uid permanently (this replaces the original's per-visit
-   * cookie-swap — a link can no longer be reused from a second device).
+   * Resolves the seat held by the address this browser is signed in as.
+   *
+   * There is no handshake and no capability to redeem: the seat either exists
+   * under that address or it does not. That is the whole of the access model,
+   * and it is why signing in from a new laptop, or after clearing cookies,
+   * simply works — the previous design bound the slot to one browser session
+   * and had no way to ever unbind it.
    */
-  private async claimInvite(inviteId: string): Promise<void> {
-    const inviteSnap = await getDoc(inviteRef(this.auctionId, inviteId));
-    if (!inviteSnap.exists()) return;
-    const { publicKey } = inviteSnap.data() as { publicKey: string };
-
-    const uRef = userRef(this.auctionId, publicKey);
-    const userSnap = await getDoc(uRef);
-    if (!userSnap.exists()) return;
-    const { role, claimUid } = userSnap.data() as UserDocData;
-    if (claimUid) return;
-
-    // Two sequential writes, not one transaction: the claims-doc rule needs to
-    // `get()` this user doc's *committed* claimUid to verify the claim, and a
-    // security rule can't see a sibling write still pending in its own transaction.
-    await updateDoc(uRef, { claimUid: this.uid, claimInviteId: inviteId });
-    await setDoc(claimRef(this.auctionId, this.uid!), { publicKey, role });
-  }
-
   private async resolveYou(): Promise<UserView | null> {
-    const claimSnap = await getDoc(claimRef(this.auctionId, this.uid!));
-    if (!claimSnap.exists()) return null;
-    const { publicKey, role } = claimSnap.data() as { publicKey: string; role: Role };
+    const seatSnap = await getDoc(seatRef(this.auctionId, this.email!));
+    if (!seatSnap.exists()) return null;
+    const seat = seatSnap.data() as SeatDocData;
+    const { publicKey, role } = seat;
 
     const userSnap = await getDoc(userRef(this.auctionId, publicKey));
     if (!userSnap.exists()) return null;
     const { label, colorIndex } = userSnap.data() as UserDocData;
+
+    // Stamp the first arrival, so the auctioneer's roster can show who has
+    // actually got in rather than only who was invited. Best-effort: a failure
+    // here must never keep a supplier off the board.
+    if (!seat.claimedUid) {
+      updateDoc(seatRef(this.auctionId, this.email!), {
+        claimedUid: this.uid,
+        claimedAt: Date.now() / 1000,
+      }).catch(() => {});
+    }
 
     // Your own identity doc — the one real name a supplier is allowed to read.
     const identitySnap = await getDoc(identityRef(this.auctionId, publicKey));
@@ -453,7 +497,7 @@ export class Connection {
    * `Repository.submit`. `addUser` also provisions the new participant's user
    * doc and a fresh invite capability, all in the same transaction.
    */
-  async submit(input: InboundEventInput): Promise<ApiResult & { event?: AuctionEvent; inviteUrl?: string }> {
+  async submit(input: InboundEventInput): Promise<ApiResult & { event?: AuctionEvent; invitedEmail?: string }> {
     if (!this.agg || !this.you) return { ok: false, error: 'Not connected yet.' };
 
     const parsed = parseInboundEvent(input, this.you.role);
@@ -471,7 +515,19 @@ export class Connection {
         : null;
 
     const draft = validated.event;
-    let inviteUrlOut: string | undefined;
+    let invitedEmail: string | undefined;
+
+    // A seat is keyed by address, so two participants cannot share one — the
+    // second would silently displace the first. Caught here rather than at the
+    // write, because the rules cannot express "must not already exist" without
+    // making seats world-readable, which is exactly what they must not be.
+    if (parsed.input.type === 'addUser') {
+      const address = normalizeEmail(parsed.input.email);
+      const existing = await getDoc(seatRef(this.auctionId, address));
+      if (existing.exists()) {
+        return { ok: false, error: `${address} is already taking part in this auction.` };
+      }
+    }
 
     try {
       await runTransaction(db, async (tx) => {
@@ -486,23 +542,25 @@ export class Connection {
 
         if (event.type === 'addUser') {
           const publicKey = event.publicKey as string;
+          const address = normalizeEmail(identity!.email);
           tx.set(userRef(this.auctionId, publicKey), {
             publicKey,
             role: event.role as Role,
             label: event.label as string,
             colorIndex: event.colorIndex as number,
-            claimUid: null,
-            claimInviteId: null,
           });
-          // The name is stripped off the event by `validateInbound` and lands
-          // here instead, behind the identities rule.
-          tx.set(identityRef(this.auctionId, publicKey), {
-            name: identity!.name,
-            ...(identity!.email ? { email: identity!.email } : {}),
+          // Name and address are stripped off the event by `validateInbound`
+          // and land here instead, behind the identities rule.
+          tx.set(identityRef(this.auctionId, publicKey), { name: identity!.name, email: address });
+          // The seat is what actually admits them. Nothing else in this
+          // transaction grants access, and no secret leaves the auctioneer's
+          // browser — the invitation goes to that inbox or nowhere.
+          tx.set(seatRef(this.auctionId, address), {
+            publicKey,
+            role: event.role as Role,
+            invitedAt: Date.now() / 1000,
           });
-          const inviteId = randomId();
-          tx.set(inviteRef(this.auctionId, inviteId), { publicKey });
-          inviteUrlOut = inviteUrl(this.auctionId, inviteId);
+          invitedEmail = address;
         }
 
         draft.seq = seq;
@@ -511,19 +569,116 @@ export class Connection {
       return { ok: false, error: err instanceof Error ? err.message : 'Request failed.' };
     }
 
-    return { ok: true, event: draft, ...(inviteUrlOut ? { inviteUrl: inviteUrlOut } : {}) };
+    return { ok: true, event: draft, ...(invitedEmail ? { invitedEmail } : {}) };
   }
 
-  /** Owner-only: mints a fresh invite link for an existing participant. */
-  async createInvite(publicKey: string): Promise<ApiResult & { inviteUrl?: string }> {
-    if (this.you?.role !== 'owner') return { ok: false, error: 'Owners only.' };
-    try {
-      const inviteId = randomId();
-      await setDoc(inviteRef(this.auctionId, inviteId), { publicKey });
-      return { ok: true, inviteUrl: inviteUrl(this.auctionId, inviteId) };
-    } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : 'Could not create a link.' };
+  // --- roster management (auctioneer only) ---------------------------------
+
+  /**
+   * Emails a fresh sign-in link to a participant. Safe to repeat: links are
+   * short-lived and single-use, so "resend" is the ordinary remedy for a
+   * supplier who lost theirs, let it expire, or is now on a different machine.
+   */
+  async sendInvite(email: string): Promise<ApiResult> {
+    if (this.you?.role !== 'owner') return { ok: false, error: 'Auctioneers only.' };
+    const sent = await sendSignInLink(email, auctionUrl(this.auctionId), false);
+    return { ok: sent.ok, ...(sent.error ? { error: sent.error } : {}) };
+  }
+
+  /**
+   * Withdraws someone's access. Deleting the seat is enough on its own — every
+   * rule resolves a caller through it — so this takes effect immediately, on
+   * whatever device they are already sitting in front of.
+   *
+   * Their slot, label, colour and any bids they placed stay on the board: the
+   * log is append-only, and a term's history would be a lie without them.
+   */
+  async revokeSeat(email: string): Promise<ApiResult> {
+    if (this.you?.role !== 'owner') return { ok: false, error: 'Auctioneers only.' };
+    if (normalizeEmail(email) === this.email) {
+      return { ok: false, error: 'You cannot remove your own access.' };
     }
+    try {
+      await deleteDoc(seatRef(this.auctionId, email));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Could not remove access.' };
+    }
+  }
+
+  /**
+   * Moves a slot to a different address — the fix for a mistyped invitation,
+   * or for a supplier who turns out to want a colleague at the keyboard.
+   *
+   * Deliberately not a rename: the old seat is deleted and a new one created,
+   * so anyone signed in under the old address loses access at the same moment
+   * the new one gains it.
+   */
+  async reassignSeat(publicKey: string, oldEmail: string, newEmail: string): Promise<ApiResult> {
+    if (this.you?.role !== 'owner') return { ok: false, error: 'Auctioneers only.' };
+    const address = normalizeEmail(newEmail);
+    if (address === normalizeEmail(oldEmail)) return { ok: true };
+
+    const user = this.agg?.users.get(publicKey);
+    if (!user) return { ok: false, error: 'No such participant.' };
+
+    try {
+      const clash = await getDoc(seatRef(this.auctionId, address));
+      if (clash.exists()) return { ok: false, error: `${address} is already taking part in this auction.` };
+
+      await setDoc(seatRef(this.auctionId, address), {
+        publicKey,
+        role: user.role,
+        invitedAt: Date.now() / 1000,
+      });
+      await deleteDoc(seatRef(this.auctionId, oldEmail));
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Could not change the address.' };
+    }
+  }
+
+  /**
+   * The auctioneer's roster: every slot, who holds it, and whether they have
+   * managed to sign in yet.
+   *
+   * Two collections have to be joined because they are protected differently —
+   * `identities` carries the firm name and `seats` carries the address and the
+   * sign-in stamp, and a supplier is allowed to read neither for anyone but
+   * themselves. Only an auctioneer can list either, which is why this is the
+   * one view where a name, a colour and an address appear together.
+   */
+  async roster(): Promise<RosterEntry[]> {
+    if (this.you?.role !== 'owner' || !this.agg) return [];
+
+    const [seatDocs, identityDocs] = await Promise.all([
+      getDocs(seatsCol(this.auctionId)),
+      getDocs(identitiesCol(this.auctionId)),
+    ]);
+
+    const seatByKey = new Map<string, { email: string; seat: SeatDocData }>();
+    for (const snap of seatDocs.docs) {
+      seatByKey.set((snap.data() as SeatDocData).publicKey, {
+        email: snap.id,
+        seat: snap.data() as SeatDocData,
+      });
+    }
+    const nameByKey = new Map<string, string>();
+    for (const snap of identityDocs.docs) nameByKey.set(snap.id, (snap.data() as IdentityDocData).name);
+
+    return [...this.agg.users.values()].map((user) => {
+      const seated = seatByKey.get(user.publicKey);
+      return {
+        publicKey: user.publicKey,
+        name: nameByKey.get(user.publicKey) ?? user.label,
+        label: user.label,
+        role: user.role,
+        colorIndex: user.colorIndex,
+        email: seated?.email ?? null,
+        signedInAt: seated?.seat.claimedAt ?? null,
+        isYou: seated?.email === this.email,
+      };
+    });
   }
 
   /** Owner-only: updates auction rules before the auction has started. */

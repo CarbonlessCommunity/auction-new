@@ -204,10 +204,26 @@ label > span { display: block; margin-bottom: 0.25rem; }
 .rules ol { margin: 0.5rem 0 0; padding-left: 1.2rem; }
 .rules li { margin-bottom: 0.35rem; }
 
-.invite {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.75rem; word-break: break-all; color: var(--muted);
+/* --- roster --- */
+/* One row per participant: who they are, whether they got in, what you can do
+   about it. Wraps to a stack on narrow screens rather than crushing the name. */
+.roster-row { flex-wrap: wrap; align-items: flex-start !important; }
+.roster-row .grow { line-height: 1.5; }
+.roster-actions { display: flex; gap: 0.15rem; flex-wrap: wrap; }
+
+.status {
+  font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;
+  padding: 0.15rem 0.45rem; border-radius: 999px; white-space: nowrap;
+  border: 1px solid var(--border); color: var(--muted);
 }
+.status.is-in { color: var(--accent); border-color: var(--accent); }
+.status.is-waiting { opacity: 0.85; }
+.status.is-revoked { color: var(--hot); border-color: var(--hot); }
+
+/* The address this browser is acting as — small, always present, and the first
+   thing to check when someone is looking at a screen they did not expect. */
+.signed-in { display: block; font-size: 0.7rem; color: var(--muted); }
+.whoami .signed-in { opacity: 0.75; }
 
 /* --- toasts --- */
 .toasts { position: fixed; right: 1rem; bottom: 1rem; display: grid; gap: 0.5rem; z-index: 100; }

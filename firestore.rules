@@ -1,18 +1,25 @@
 rules_version = '2';
 
 // Best-effort enforcement for a Spark-plan (no Cloud Functions) deployment.
-// There is no trusted server: everything here is what a signed-in anonymous
-// client can be made to prove using only its own uid and document reads.
+// There is no trusted server: everything here is what a signed-in client can be
+// made to prove using only its own auth token and document reads.
+//
+// Identity is a *verified email address*, established by Firebase's
+// passwordless email-link sign-in. The auctioneer invites an address; the
+// person who can read that inbox gets the seat, on any device, as often as they
+// like. Nothing in a URL grants access, so a forwarded link is worthless and a
+// supplier who clears their cookies mid-auction simply signs in again.
+//
 // What this CANNOT do — deliberately accepted trade-offs, see project notes:
 //   - Blind Last-Call secrecy: a technical reader can list `events` directly
 //     and see hidden bids; the client only hides them at render time.
 //   - Bid arithmetic (beats-current-best, extended-time math, min-step):
 //     enforced client-side only (`validateInbound`), not re-derived here.
-// What this DOES enforce: only the real owner can issue admin events, only a
-// claimed bidder slot can bid as itself, a supplier can withdraw only their own
-// bid, an observer can write nothing at all, events are append-only, a user slot
-// can only ever be claimed once, and — see `identities` below — a supplier
-// cannot read any other supplier's name or email by any route.
+// What this DOES enforce: only an auctioneer can issue admin events, only a
+// seated bidder can bid as itself, a supplier can withdraw only their own bid,
+// an observer can write nothing at all, events are append-only, only the
+// auctioneer can seat or unseat anyone, and — see `identities` below — a
+// supplier cannot read any other supplier's name or email by any route.
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -22,19 +29,43 @@ service cloud.firestore {
         return get(/databases/$(database)/documents/auctions/$(auctionId)).data;
       }
 
+      // ---- identity -------------------------------------------------------
+      //
+      // The writer's seat, looked up by the verified address on their token.
+      // This replaces the old uid-keyed `claims` mirror: because the seat is
+      // keyed by email rather than by browser session, revoking it (deleting
+      // the doc) takes effect immediately and everywhere, and a second device
+      // needs no new capability.
+
+      function seatPath() {
+        return /databases/$(database)/documents/auctions/$(auctionId)/seats/$(request.auth.token.email);
+      }
+
+      // `email_verified` is the load-bearing check. Email-link sign-in sets it;
+      // without it, any sign-in method that let a caller assert an unverified
+      // address would hand them someone else's seat.
+      function hasSeat() {
+        return request.auth != null
+          && 'email' in request.auth.token
+          && request.auth.token.email != null
+          && request.auth.token.email_verified == true
+          && exists(seatPath());
+      }
+
+      function seat() {
+        return get(seatPath()).data;
+      }
+
+      // The auction's creator, plus anyone they later seated as an auctioneer.
+      // (`ownerUid` alone is kept so auction creation has a bootstrap identity
+      // before any seat exists.)
       function isOwner() {
-        return request.auth != null && auction().ownerUid == request.auth.uid;
+        return request.auth != null
+          && (auction().ownerUid == request.auth.uid || (hasSeat() && seat().role == 'owner'));
       }
 
-      // A signed-in writer's own slot, resolved via the uid-keyed claims
-      // mirror below instead of a query (rules can't run `where(...)`).
-      function claim() {
-        return get(/databases/$(database)/documents/auctions/$(auctionId)/claims/$(request.auth.uid)).data;
-      }
-
-      function hasClaim() {
-        return request.auth != null &&
-          exists(/databases/$(database)/documents/auctions/$(auctionId)/claims/$(request.auth.uid));
+      function isBidder() {
+        return hasSeat() && seat().role == 'bidder';
       }
 
       allow get: if request.auth != null;
@@ -70,7 +101,7 @@ service cloud.firestore {
         // for everyone (0) or stall it indefinitely. Extended Time only ever
         // pushes the main clock back out to the threshold, so the largest
         // legitimate bump is the threshold itself, and it never moves backwards.
-        hasClaim() && claim().role == 'bidder'
+        isBidder()
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nextSeq', 'auctionLength'])
         && request.resource.data.nextSeq == resource.data.nextSeq + 1
         && request.resource.data.auctionLength >= resource.data.auctionLength
@@ -100,16 +131,13 @@ service cloud.firestore {
 
         // The auctioneer may withdraw any bid; a supplier only their own. A
         // cancellation names the bid's owner in `bidder` — rules cannot follow
-        // `bidSeq` to the bid document, so this checks the *claim* against that
+        // `bidSeq` to the bid document, so this checks the *seat* against that
         // name, and the client fold refuses any cancellation whose named owner
         // is not the target bid's actual bidder. A supplier can therefore only
         // write a cancellation naming themselves, which can only ever take
         // effect on one of their own bids.
         function isAllowedCancel() {
-          return isOwner() || (
-            hasClaim() && claim().role == 'bidder'
-            && request.resource.data.bidder == claim().publicKey
-          );
+          return isOwner() || (isBidder() && request.resource.data.bidder == seat().publicKey);
         }
 
         function isAllowedBid() {
@@ -119,45 +147,28 @@ service cloud.firestore {
             // meaningful security boundary given everything else here.
             && request.time.toMillis() / 1000 <= auction().startedAt + auction().auctionLength + 5;
           let onBehalf = 'placedBy' in data;
-          let asSelf = hasClaim() && claim().role == 'bidder' && claim().publicKey == data.bidder;
+          let asSelf = isBidder() && seat().publicKey == data.bidder;
           return withinWindow && (onBehalf ? isOwner() : asSelf);
         }
       }
 
-      // ---- users/{publicKey} : claimable slots ----------------------------
+      // ---- users/{publicKey} : the public roster --------------------------
       //
-      // Readable by any signed-in client, because the invite handshake has to
-      // read a slot before it holds a claim of its own. That is only safe
+      // Readable by any signed-in client, because a viewer resolves their own
+      // slot here before anything else is known about them. That is only safe
       // because these docs carry nothing identifying — just the role, the
-      // public label ("Supplier C") and the palette slot. Names live in
-      // `identities` below.
+      // public label ("Supplier C") and the palette slot. Names and email
+      // addresses live in `identities` and `seats`, both closed to a rival.
       match /users/{publicKey} {
         // No `list`: the roster is derived client-side by folding `addUser`
         // events, so nothing legitimate ever queries this collection.
         allow get: if request.auth != null;
         allow list: if false;
 
-        allow create: if isOwner()
-          && (
-            request.resource.data.claimUid == null ||
-            // Only the bootstrap owner slot may arrive pre-claimed, and only
-            // by the auction's own owner claiming themselves.
-            (request.resource.data.claimUid == request.auth.uid
-              && request.resource.data.role == 'owner'
-              && request.auth.uid == auction().ownerUid)
-          );
-
-        // Write-once claim: an unclaimed slot may bind itself to the caller's
-        // uid via a matching invite, changing nothing else.
-        allow update: if request.auth != null
-          && resource.data.claimUid == null
-          && request.resource.data.claimUid == request.auth.uid
-          && request.resource.data.claimInviteId is string
-          && exists(/databases/$(database)/documents/auctions/$(auctionId)/invites/$(request.resource.data.claimInviteId))
-          && get(/databases/$(database)/documents/auctions/$(auctionId)/invites/$(request.resource.data.claimInviteId)).data.publicKey == publicKey
-          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimUid', 'claimInviteId']);
-
-        allow delete: if false;
+        allow create: if isOwner();
+        // Immutable once written. Who *occupies* a slot is now a property of
+        // the seat, not of this doc, so there is nothing here left to change.
+        allow update, delete: if false;
       }
 
       // ---- identities/{publicKey} : real names, access-controlled ---------
@@ -175,38 +186,48 @@ service cloud.firestore {
       // during it, and not after results are released.
       match /identities/{publicKey} {
         allow get: if isOwner()
-          || (hasClaim() && (claim().role == 'viewer' || claim().publicKey == publicKey));
-        allow list: if isOwner() || (hasClaim() && claim().role == 'viewer');
+          || (hasSeat() && (seat().role == 'viewer' || seat().publicKey == publicKey));
+        allow list: if isOwner() || (hasSeat() && seat().role == 'viewer');
         allow create: if isOwner();
         // Immutable: a rename would otherwise let the auctioneer's screen and a
         // supplier's own screen disagree about who bid what after the fact.
         allow update, delete: if false;
       }
 
-      // ---- invites/{inviteId} : bearer capability -------------------------
-      match /invites/{inviteId} {
-        // `get` only — never `list` — since an invite id is a bearer secret;
-        // listing the collection would hand out every capability at once.
-        allow get: if request.auth != null;
-        allow list: if false;
-        allow create: if isOwner();
-        allow update, delete: if false;
-      }
+      // ---- seats/{email} : who may occupy which slot ----------------------
+      //
+      // The access-control table, keyed by the invited address so that a
+      // sign-in token can be checked against it directly. Deleting a seat is
+      // how the auctioneer revokes someone; creating one under a different
+      // address is how they correct a typo in an invitation.
+      //
+      // A seat is as sensitive as an identity — `{email: supplier}` is exactly
+      // the mapping the auction exists to hide — so a supplier may read only
+      // their own, and only the auctioneer may enumerate them. Note the read
+      // rule matches on the address rather than on `hasSeat()`: someone whose
+      // seat was revoked still needs to be able to establish that fact.
+      match /seats/{email} {
+        allow get: if isOwner()
+          || (request.auth != null && 'email' in request.auth.token && request.auth.token.email == email);
+        allow list: if isOwner();
 
-      // ---- claims/{uid} : uid -> (publicKey, role) mirror -----------------
-      match /claims/{uid} {
-        allow get: if request.auth != null && request.auth.uid == uid;
-        allow list: if false;
-        // Create-only (first-claim-wins per uid), and only once the matching
-        // user doc already shows that uid as its claimant.
-        allow create: if request.auth != null && request.auth.uid == uid && (
-          (request.resource.data.role == 'owner' && auction().ownerUid == uid) ||
-          (
-            get(/databases/$(database)/documents/auctions/$(auctionId)/users/$(request.resource.data.publicKey)).data.claimUid == uid &&
-            get(/databases/$(database)/documents/auctions/$(auctionId)/users/$(request.resource.data.publicKey)).data.role == request.resource.data.role
-          )
-        );
-        allow update, delete: if false;
+        allow create: if isOwner()
+          && request.resource.data.keys().hasOnly(['publicKey', 'role', 'invitedAt'])
+          && request.resource.data.role in ['owner', 'bidder', 'viewer'];
+
+        // The seat holder stamps their own first sign-in, so the auctioneer's
+        // roster can distinguish "invited" from "has actually got in" — the
+        // question they need answered in the minutes before an auction opens.
+        // Nothing else about a seat may be changed by its holder: the slot and
+        // the role it grants stay exactly as the auctioneer wrote them.
+        allow update: if request.auth != null
+          && 'email' in request.auth.token
+          && request.auth.token.email == email
+          && request.auth.token.email_verified == true
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimedUid', 'claimedAt'])
+          && request.resource.data.claimedUid == request.auth.uid;
+
+        allow delete: if isOwner();
       }
     }
   }
