@@ -14,10 +14,18 @@ import {
 } from 'firebase/firestore';
 import type { User } from 'firebase/auth';
 import { db } from './firebase';
-import { currentUser, normalizeEmail, sendSignInLink } from './auth';
+import {
+  createParticipantAccount,
+  currentUser,
+  generatePassword,
+  normalizeEmail,
+  reloadUser,
+  setParticipantPassword,
+} from './auth';
+import { isAdminEmail } from '../shared/admins';
 import { AuctionAggregate, type Participant } from '../shared/aggregate';
 import { configSchema } from '../shared/config';
-import { totalRunSec } from '../shared/rules';
+import { MAX_BIDDERS, totalRunSec } from '../shared/rules';
 import { parseInboundEvent } from '../shared/schemas';
 import { filterOutbound, validateInbound } from '../shared/validation';
 import type { AddUserInput, AuctionConfig, AuctionEvent, AuctionMeta, InboundEventInput, Role, UserView } from '../shared/types';
@@ -37,11 +45,18 @@ export interface RosterEntry {
   label: string;
   role: Role;
   colorIndex: number;
-  /** The invited address, or null if the seat has been revoked. */
+  /** The participant's address, or null if the seat has been revoked. */
   email: string | null;
   /** When they first signed in, or null if they never have. */
   signedInAt: number | null;
   isYou: boolean;
+  /**
+   * Admin panel only: the generated password on file for this account, and
+   * whether the account pre-existed (in which case there is no password to
+   * show — the participant already has one). `password` also goes null once
+   * the participant changes it themselves.
+   */
+  credential?: { password: string | null; preexisting: boolean } | null;
 }
 
 /**
@@ -56,6 +71,8 @@ interface AuctionDocData {
   name: string;
   config: AuctionConfig;
   ownerUid: string;
+  /** The auctioneer's slot in `users`, so an admin can resolve to it without a seat. */
+  ownerPublicKey: string;
   nextSeq: number;
   startedAt: number | null;
   auctionLength: number;
@@ -106,6 +123,19 @@ interface IdentityDocData {
   email?: string;
 }
 
+/**
+ * `auctions/{id}/credentials/{publicKey}` — the generated password for a
+ * participant's account, kept so either admin can re-read and relay it.
+ * `firestore.rules` scopes this to admins alone.
+ */
+interface CredentialDocData {
+  email: string;
+  /** null once the participant sets their own password, or if the account pre-existed. */
+  password: string | null;
+  preexisting: boolean;
+  updatedAt: number;
+}
+
 const auctionRef = (id: string) => doc(db, 'auctions', id);
 const eventsCol = (id: string) => collection(db, 'auctions', id, 'events');
 const eventRef = (id: string, seq: number) => doc(db, 'auctions', id, 'events', String(seq).padStart(10, '0'));
@@ -114,6 +144,11 @@ const identitiesCol = (id: string) => collection(db, 'auctions', id, 'identities
 const identityRef = (id: string, publicKey: string) => doc(db, 'auctions', id, 'identities', publicKey);
 const seatsCol = (id: string) => collection(db, 'auctions', id, 'seats');
 const seatRef = (id: string, email: string) => doc(db, 'auctions', id, 'seats', normalizeEmail(email));
+const credentialsCol = (id: string) => collection(db, 'auctions', id, 'credentials');
+const credentialRef = (id: string, publicKey: string) => doc(db, 'auctions', id, 'credentials', publicKey);
+
+/** Force one ID-token refresh per session, so a fresh verification click reaches the rules. */
+let adminTokenRefreshed = false;
 
 /** Random bytes, hex-encoded — used for unguessable auction ids. */
 function randomId(bytes: number): string {
@@ -122,28 +157,43 @@ function randomId(bytes: number): string {
   return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** The page a sign-in link should return someone to. */
+/** The board URL for an auction — what an admin hands a participant. */
 export function auctionUrl(auctionId: string): string {
   return `${location.origin}/a/${auctionId}`;
 }
 
-/** Raised when an operation needs a signed-in, email-verified user and has none. */
+/** Every auction, newest first — the admin panel's list. Admins only (by rule). */
+export async function listAuctions(): Promise<Array<{ id: string; name: string; createdAt: number | null }>> {
+  const snap = await getDocs(collection(db, 'auctions'));
+  return snap.docs
+    .map((docSnap) => {
+      const data = docSnap.data() as { name?: string; createdAt?: { toMillis?: () => number } };
+      return {
+        id: docSnap.id,
+        name: data.name ?? '(untitled)',
+        createdAt: data.createdAt?.toMillis?.() ?? null,
+      };
+    })
+    .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+}
+
+/** Raised when an operation needs a signed-in user and has none. */
 export class NotSignedInError extends Error {
   constructor() {
-    super('Sign in with your email address to continue.');
+    super('Sign in to continue.');
     this.name = 'NotSignedInError';
   }
 }
 
 /**
- * The signed-in user, insisting on a *verified* address. Everything downstream
- * — the seat lookup, every rule in `firestore.rules` — keys off that address,
- * so a session without one cannot be allowed to proceed as if it had a claim
- * to anything.
+ * The signed-in user, insisting on an address. Everything downstream — the seat
+ * lookup, every rule in `firestore.rules` — keys off that address, so a session
+ * without one cannot proceed. Email *verification* is only required of an admin
+ * (see `firestore.rules`), and is checked separately in `init()`.
  */
-async function requireVerifiedUser(): Promise<User & { email: string }> {
+async function requireUser(): Promise<User & { email: string }> {
   const user = await currentUser();
-  if (!user || !user.email || !user.emailVerified) throw new NotSignedInError();
+  if (!user || !user.email) throw new NotSignedInError();
   return user as User & { email: string };
 }
 
@@ -173,18 +223,18 @@ export interface CreateAuctionInput {
 }
 
 /**
- * Creates a new auction: the auction doc first (so `ownerUid` exists for
- * `isOwner()` rule checks), then the bootstrap `setName`/`addUser` events and
- * the owner's own user doc and seat.
+ * Creates a new auction: the auction doc first (so the rules can see it), then
+ * the bootstrap `setName`/`addUser` events and the auctioneer's own user and
+ * identity docs.
  *
- * The creator must already be signed in, because the auctioneer is a
- * participant like any other — their seat is what gets them back into their own
- * auction from a second device, and what makes "auctioneer" a role someone
- * holds rather than a browser that happens to remember something.
+ * The creator is an admin, already signed in — the admin panel is where this is
+ * called from. The auctioneer gets a slot in `users` like any participant but
+ * *no seat*: an admin resolves to the `owner` role straight from their token
+ * (see `resolveYou`), so it works from any device with no capability to carry.
  */
 export async function createAuction(input: CreateAuctionInput): Promise<ApiResult & { id?: string }> {
   try {
-    const user = await requireVerifiedUser();
+    const user = await requireUser();
     const id = randomId(6);
     const aRef = auctionRef(id);
 
@@ -192,6 +242,10 @@ export async function createAuction(input: CreateAuctionInput): Promise<ApiResul
       name: input.name,
       config: input.config,
       ownerUid: user.uid,
+      // The auctioneer is always the first `addUser` (seq 1); `setName` adds no
+      // user, so its publicKey is '0'. Kept on the doc so an admin can resolve
+      // to that slot without reading the log.
+      ownerPublicKey: '0',
       nextSeq: 0,
       startedAt: null,
       auctionLength: totalRunSec(input.config),
@@ -228,7 +282,7 @@ export async function createAuction(input: CreateAuctionInput): Promise<ApiResul
 
     await runTransaction(db, async (tx) => {
       tx.set(eventRef(id, 1), owner.event);
-      tx.update(aRef, { nextSeq: 2 });
+      tx.update(aRef, { nextSeq: 2, ownerPublicKey: ownerKey });
       tx.set(userRef(id, ownerKey), {
         publicKey: ownerKey,
         role: 'owner',
@@ -236,14 +290,7 @@ export async function createAuction(input: CreateAuctionInput): Promise<ApiResul
         colorIndex: owner.event.colorIndex as number,
       });
       tx.set(identityRef(id, ownerKey), { name: input.ownerName, email: user.email });
-      // Seated under the address they are signed in with. The claim stamp lands
-      // on the next line of the story — they are about to be redirected onto
-      // the auction page, which stamps it like any other arriving participant.
-      tx.set(seatRef(id, user.email), {
-        publicKey: ownerKey,
-        role: 'owner',
-        invitedAt: Date.now() / 1000,
-      });
+      // No seat: an admin resolves to `owner` from their token alone.
     });
     agg.apply(owner.event);
 
@@ -354,20 +401,24 @@ export class Connection {
   }
 
   private async init(): Promise<void> {
-    const user = await requireVerifiedUser();
+    let user = await requireUser();
     this.uid = user.uid;
     this.email = user.email;
 
-    const you = await this.resolveYou();
-    if (!you) {
+    // An admin's stored session can carry a stale `email_verified` in its ID
+    // token right after a verification click. Force one refresh per session so
+    // the claim the rules read catches up; only then give up.
+    if (isAdminEmail(user.email) && (!adminTokenRefreshed || !user.emailVerified)) {
+      await reloadUser();
+      adminTokenRefreshed = true;
+      user = await requireUser();
+    }
+    if (isAdminEmail(user.email) && !user.emailVerified) {
       this.authError =
-        `${user.email} has not been invited to this auction. ` +
-        'Ask the auctioneer to invite that address — or sign out and sign in with the one they used.';
+        'Verify your email address first — open the link we emailed when you set your password, then reload.';
       this.emit();
       return;
     }
-    this.you = you;
-    this.identities.set(you.publicKey, you.name);
 
     const auctionSnap = await getDoc(auctionRef(this.auctionId));
     if (!auctionSnap.exists()) {
@@ -377,6 +428,17 @@ export class Connection {
     }
     this.auctionData = auctionSnap.data() as AuctionDocData;
     this.auction = { id: this.auctionId, name: this.auctionData.name, config: this.auctionData.config };
+
+    const you = await this.resolveYou();
+    if (!you) {
+      this.authError =
+        `${user.email} is not part of this auction. Ask an auctioneer to add that address` +
+        ' — or sign out and sign in with the one they used.';
+      this.emit();
+      return;
+    }
+    this.you = you;
+    this.identities.set(you.publicKey, you.name);
 
     // Paint now, on an empty log, rather than waiting for the events listener's
     // first snapshot. Identity and config are already known, which is all the
@@ -465,6 +527,25 @@ export class Connection {
    * and had no way to ever unbind it.
    */
   private async resolveYou(): Promise<UserView | null> {
+    // An admin holds the `owner` role on every auction, straight from their
+    // verified address — no seat, nothing to lose or forward.
+    if (isAdminEmail(this.email)) {
+      const ownerKey = this.auctionData?.ownerPublicKey ?? '0';
+      const userSnap = await getDoc(userRef(this.auctionId, ownerKey));
+      const slot = userSnap.exists() ? (userSnap.data() as UserDocData) : null;
+      const identitySnap = await getDoc(identityRef(this.auctionId, ownerKey));
+      const name = identitySnap.exists()
+        ? (identitySnap.data() as IdentityDocData).name
+        : 'Auctioneer';
+      return {
+        publicKey: ownerKey,
+        role: 'owner',
+        label: slot?.label ?? 'Auctioneer',
+        colorIndex: slot?.colorIndex ?? 0,
+        name,
+      };
+    }
+
     const seatSnap = await getDoc(seatRef(this.auctionId, this.email!));
     if (!seatSnap.exists()) return null;
     const seat = seatSnap.data() as SeatDocData;
@@ -494,8 +575,9 @@ export class Connection {
   /**
    * Validates locally (for instant feedback) then atomically allocates the
    * next `seq` and appends the event — the client-side successor to
-   * `Repository.submit`. `addUser` also provisions the new participant's user
-   * doc and a fresh invite capability, all in the same transaction.
+   * `Repository.submit`. `addUser` also provisions the new participant's roster
+   * slot, identity and seat in the same transaction (their email/password
+   * account is created separately, in `createParticipant`).
    */
   async submit(input: InboundEventInput): Promise<ApiResult & { event?: AuctionEvent; invitedEmail?: string }> {
     if (!this.agg || !this.you) return { ok: false, error: 'Not connected yet.' };
@@ -552,9 +634,7 @@ export class Connection {
           // Name and address are stripped off the event by `validateInbound`
           // and land here instead, behind the identities rule.
           tx.set(identityRef(this.auctionId, publicKey), { name: identity!.name, email: address });
-          // The seat is what actually admits them. Nothing else in this
-          // transaction grants access, and no secret leaves the auctioneer's
-          // browser — the invitation goes to that inbox or nowhere.
+          // The seat is what actually admits them, keyed by their address.
           tx.set(seatRef(this.auctionId, address), {
             publicKey,
             role: event.role as Role,
@@ -572,34 +652,121 @@ export class Connection {
     return { ok: true, event: draft, ...(invitedEmail ? { invitedEmail } : {}) };
   }
 
-  // --- roster management (auctioneer only) ---------------------------------
+  // --- participant management (admin only) -------------------------------
 
-  /**
-   * Emails a fresh sign-in link to a participant. Safe to repeat: links are
-   * short-lived and single-use, so "resend" is the ordinary remedy for a
-   * supplier who lost theirs, let it expire, or is now on a different machine.
-   */
-  async sendInvite(email: string): Promise<ApiResult> {
-    if (this.you?.role !== 'owner') return { ok: false, error: 'Auctioneers only.' };
-    const sent = await sendSignInLink(email, auctionUrl(this.auctionId), false);
-    return { ok: sent.ok, ...(sent.error ? { error: sent.error } : {}) };
+  private adminGuard(): ApiResult | null {
+    return isAdminEmail(this.email) ? null : { ok: false, error: 'Auctioneers only.' };
   }
 
   /**
-   * Withdraws someone's access. Deleting the seat is enough on its own — every
-   * rule resolves a caller through it — so this takes effect immediately, on
-   * whatever device they are already sitting in front of.
+   * Creates a participant: their email/password account (on a throwaway
+   * secondary app, so this admin stays signed in), then the `addUser` event +
+   * roster slot + identity + seat, then the generated password on file at
+   * `credentials/{publicKey}`.
    *
-   * Their slot, label, colour and any bids they placed stay on the board: the
-   * log is append-only, and a term's history would be a lie without them.
+   * Returns the plaintext password once, for the panel to show and the admin to
+   * relay out of band. If the address already had an account it is seated as
+   * it is and no password comes back — the participant keeps the one they have.
    */
-  async revokeSeat(email: string): Promise<ApiResult> {
-    if (this.you?.role !== 'owner') return { ok: false, error: 'Auctioneers only.' };
+  async createParticipant(input: {
+    name: string;
+    email: string;
+    role: Role;
+  }): Promise<ApiResult & { email?: string; password?: string; preexisting?: boolean }> {
+    const guard = this.adminGuard();
+    if (guard) return guard;
+
+    const address = normalizeEmail(input.email);
+    if (input.role === 'bidder' && this.agg && this.agg.countRole('bidder') >= MAX_BIDDERS) {
+      return { ok: false, error: `An auction can have at most ${MAX_BIDDERS} bidding firms.` };
+    }
+    const existing = await getDoc(seatRef(this.auctionId, address));
+    if (existing.exists()) {
+      return { ok: false, error: `${address} is already taking part in this auction.` };
+    }
+
+    const password = generatePassword();
+    const account = await createParticipantAccount(address, password);
+    if (!account.ok && !account.preexisting) {
+      return { ok: false, error: account.error ?? 'Could not create the account.' };
+    }
+    const preexisting = account.preexisting === true;
+
+    const result = await this.submit({
+      type: 'addUser',
+      name: input.name,
+      role: input.role,
+      email: address,
+    });
+    if (!result.ok || !result.event) {
+      return { ok: false, error: result.error ?? 'Could not add the participant.' };
+    }
+    const publicKey = result.event.publicKey as string;
+
+    await setDoc(credentialRef(this.auctionId, publicKey), {
+      email: address,
+      password: preexisting ? null : password,
+      preexisting,
+      updatedAt: Date.now() / 1000,
+    } satisfies CredentialDocData);
+
+    return { ok: true, email: address, preexisting, ...(preexisting ? {} : { password }) };
+  }
+
+  /**
+   * Sets a fresh password on a participant's account and updates the copy on
+   * file. Works only while the stored password is still current — if the
+   * participant has changed it themselves, remove and re-add them instead.
+   */
+  async resetParticipantPassword(
+    publicKey: string,
+    email: string,
+  ): Promise<ApiResult & { password?: string }> {
+    const guard = this.adminGuard();
+    if (guard) return guard;
+
+    const snap = await getDoc(credentialRef(this.auctionId, publicKey));
+    const current = snap.exists() ? (snap.data() as CredentialDocData) : null;
+    if (!current || current.preexisting || !current.password) {
+      return {
+        ok: false,
+        error: 'No password on file for this account — remove and re-add them to issue a new one.',
+      };
+    }
+
+    const next = generatePassword();
+    const changed = await setParticipantPassword(email, current.password, next);
+    if (!changed.ok) {
+      return {
+        ok: false,
+        error:
+          changed.error ??
+          'Could not set a new password — the participant may have changed it themselves.',
+      };
+    }
+
+    await updateDoc(credentialRef(this.auctionId, publicKey), {
+      password: next,
+      updatedAt: Date.now() / 1000,
+    });
+    return { ok: true, password: next };
+  }
+
+  /**
+   * Withdraws a participant's access. Deleting the seat is enough on its own —
+   * every rule resolves a caller through it — so this bites immediately, on
+   * whatever device they are already using. Their slot, colour and any bids
+   * stay on the board; the log is append-only.
+   */
+  async revokeParticipant(email: string, publicKey?: string): Promise<ApiResult> {
+    const guard = this.adminGuard();
+    if (guard) return guard;
     if (normalizeEmail(email) === this.email) {
       return { ok: false, error: 'You cannot remove your own access.' };
     }
     try {
       await deleteDoc(seatRef(this.auctionId, email));
+      if (publicKey) await deleteDoc(credentialRef(this.auctionId, publicKey)).catch(() => {});
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : 'Could not remove access.' };
@@ -607,53 +774,74 @@ export class Connection {
   }
 
   /**
-   * Moves a slot to a different address — the fix for a mistyped invitation,
-   * or for a supplier who turns out to want a colleague at the keyboard.
-   *
-   * Deliberately not a rename: the old seat is deleted and a new one created,
-   * so anyone signed in under the old address loses access at the same moment
-   * the new one gains it.
+   * Moves a slot to a different address and issues that address its own
+   * account — the fix for a mistyped email. The old seat is deleted, so anyone
+   * on the old address loses access the moment the new one gains it; the slot,
+   * colour and any bids are kept.
    */
-  async reassignSeat(publicKey: string, oldEmail: string, newEmail: string): Promise<ApiResult> {
-    if (this.you?.role !== 'owner') return { ok: false, error: 'Auctioneers only.' };
+  async changeParticipantEmail(
+    publicKey: string,
+    oldEmail: string,
+    newEmail: string,
+  ): Promise<ApiResult & { email?: string; password?: string; preexisting?: boolean }> {
+    const guard = this.adminGuard();
+    if (guard) return guard;
+
     const address = normalizeEmail(newEmail);
     if (address === normalizeEmail(oldEmail)) return { ok: true };
 
     const user = this.agg?.users.get(publicKey);
     if (!user) return { ok: false, error: 'No such participant.' };
 
-    try {
-      const clash = await getDoc(seatRef(this.auctionId, address));
-      if (clash.exists()) return { ok: false, error: `${address} is already taking part in this auction.` };
+    const clash = await getDoc(seatRef(this.auctionId, address));
+    if (clash.exists()) {
+      return { ok: false, error: `${address} is already taking part in this auction.` };
+    }
 
+    const password = generatePassword();
+    const account = await createParticipantAccount(address, password);
+    if (!account.ok && !account.preexisting) {
+      return { ok: false, error: account.error ?? 'Could not create the account.' };
+    }
+    const preexisting = account.preexisting === true;
+
+    try {
       await setDoc(seatRef(this.auctionId, address), {
         publicKey,
         role: user.role,
         invitedAt: Date.now() / 1000,
       });
       await deleteDoc(seatRef(this.auctionId, oldEmail));
-      return { ok: true };
+      await setDoc(credentialRef(this.auctionId, publicKey), {
+        email: address,
+        password: preexisting ? null : password,
+        preexisting,
+        updatedAt: Date.now() / 1000,
+      } satisfies CredentialDocData);
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : 'Could not change the address.' };
     }
+
+    return { ok: true, email: address, preexisting, ...(preexisting ? {} : { password }) };
   }
 
   /**
-   * The auctioneer's roster: every slot, who holds it, and whether they have
-   * managed to sign in yet.
+   * The auctioneer's roster: every slot, who holds it, whether they have signed
+   * in yet, and — for an admin — the password on file for the account.
    *
-   * Two collections have to be joined because they are protected differently —
-   * `identities` carries the firm name and `seats` carries the address and the
-   * sign-in stamp, and a supplier is allowed to read neither for anyone but
-   * themselves. Only an auctioneer can list either, which is why this is the
-   * one view where a name, a colour and an address appear together.
+   * `identities` (firm name), `seats` (address + sign-in stamp) and
+   * `credentials` (password) are joined here because they are protected
+   * separately and a supplier may read none of them for anyone but themselves.
+   * This is the one view where a name, a colour and an address appear together.
    */
   async roster(): Promise<RosterEntry[]> {
     if (this.you?.role !== 'owner' || !this.agg) return [];
+    const admin = isAdminEmail(this.email);
 
-    const [seatDocs, identityDocs] = await Promise.all([
+    const [seatDocs, identityDocs, credentialDocs] = await Promise.all([
       getDocs(seatsCol(this.auctionId)),
       getDocs(identitiesCol(this.auctionId)),
+      admin ? getDocs(credentialsCol(this.auctionId)) : Promise.resolve(null),
     ]);
 
     const seatByKey = new Map<string, { email: string; seat: SeatDocData }>();
@@ -664,7 +852,17 @@ export class Connection {
       });
     }
     const nameByKey = new Map<string, string>();
-    for (const snap of identityDocs.docs) nameByKey.set(snap.id, (snap.data() as IdentityDocData).name);
+    const emailByKey = new Map<string, string>();
+    for (const snap of identityDocs.docs) {
+      const data = snap.data() as IdentityDocData;
+      nameByKey.set(snap.id, data.name);
+      if (data.email) emailByKey.set(snap.id, data.email);
+    }
+    const credByKey = new Map<string, { password: string | null; preexisting: boolean }>();
+    for (const snap of credentialDocs?.docs ?? []) {
+      const data = snap.data() as CredentialDocData;
+      credByKey.set(snap.id, { password: data.password, preexisting: data.preexisting });
+    }
 
     return [...this.agg.users.values()].map((user) => {
       const seated = seatByKey.get(user.publicKey);
@@ -674,9 +872,10 @@ export class Connection {
         label: user.label,
         role: user.role,
         colorIndex: user.colorIndex,
-        email: seated?.email ?? null,
+        email: seated?.email ?? emailByKey.get(user.publicKey) ?? null,
         signedInAt: seated?.seat.claimedAt ?? null,
-        isYou: seated?.email === this.email,
+        isYou: user.publicKey === this.you?.publicKey,
+        credential: credByKey.get(user.publicKey) ?? null,
       };
     });
   }

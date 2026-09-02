@@ -4,11 +4,16 @@ rules_version = '2';
 // There is no trusted server: everything here is what a signed-in client can be
 // made to prove using only its own auth token and document reads.
 //
-// Identity is a *verified email address*, established by Firebase's
-// passwordless email-link sign-in. The auctioneer invites an address; the
-// person who can read that inbox gets the seat, on any device, as often as they
-// like. Nothing in a URL grants access, so a forwarded link is worthless and a
-// supplier who clears their cookies mid-auction simply signs in again.
+// Identity is an email address on the sign-in token. Two of them — the admins,
+// listed in `isAdmin()` below and mirrored from `src/shared/admins.ts` — run
+// every auction: they create auctions and provision every participant's
+// email/password account. A participant is admitted by a *seat* the admin wrote
+// at `auctions/{id}/seats/{their-email}`; nothing in a URL grants access.
+//
+// `email_verified` is required for an *admin* (an admin address is one anybody
+// could register here, so the inbox check is what makes it trustworthy) but NOT
+// for a participant: a participant account can only be created by an admin, so
+// the admin is already the authority on which address maps to which seat.
 //
 // What this CANNOT do — deliberately accepted trade-offs, see project notes:
 //   - Blind Last-Call secrecy: a technical reader can list `events` directly
@@ -17,9 +22,10 @@ rules_version = '2';
 //     enforced client-side only (`validateInbound`), not re-derived here.
 // What this DOES enforce: only an auctioneer can issue admin events, only a
 // seated bidder can bid as itself, a supplier can withdraw only their own bid,
-// an observer can write nothing at all, events are append-only, only the
-// auctioneer can seat or unseat anyone, and — see `identities` below — a
-// supplier cannot read any other supplier's name or email by any route.
+// an observer can write nothing at all, events are append-only, only an admin
+// can create an auction or read a participant's stored password, and — see
+// `identities` below — a supplier cannot read any other supplier's name or
+// email by any route.
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -29,26 +35,35 @@ service cloud.firestore {
         return get(/databases/$(database)/documents/auctions/$(auctionId)).data;
       }
 
-      // ---- identity -------------------------------------------------------
+      // ---- identity -----------------------------------------------------
       //
-      // The writer's seat, looked up by the verified address on their token.
-      // This replaces the old uid-keyed `claims` mirror: because the seat is
-      // keyed by email rather than by browser session, revoking it (deleting
-      // the doc) takes effect immediately and everywhere, and a second device
-      // needs no new capability.
+      // The two people who run auctions. Token-only, so this is cheap and
+      // works before any document exists (auction creation). Kept in sync
+      // with `src/shared/admins.ts` by hand — rules cannot import it.
+      function isAdmin() {
+        return request.auth != null
+          && 'email' in request.auth.token
+          && request.auth.token.email_verified == true
+          && request.auth.token.email in [
+            'jeffreyhuang165@gmail.com',
+            'craig.r.schuttenberg@gmail.com'
+          ];
+      }
 
+      // The writer's seat, looked up by the address on their token. Keyed by
+      // email rather than by browser session, so revoking it (deleting the
+      // doc) takes effect immediately and everywhere, and a second device
+      // needs no new capability.
       function seatPath() {
         return /databases/$(database)/documents/auctions/$(auctionId)/seats/$(request.auth.token.email);
       }
 
-      // `email_verified` is the load-bearing check. Email-link sign-in sets it;
-      // without it, any sign-in method that let a caller assert an unverified
-      // address would hand them someone else's seat.
+      // No `email_verified` here — see the file header. A seated address is one
+      // an admin assigned to an account the admin created.
       function hasSeat() {
         return request.auth != null
           && 'email' in request.auth.token
           && request.auth.token.email != null
-          && request.auth.token.email_verified == true
           && exists(seatPath());
       }
 
@@ -56,12 +71,9 @@ service cloud.firestore {
         return get(seatPath()).data;
       }
 
-      // The auction's creator, plus anyone they later seated as an auctioneer.
-      // (`ownerUid` alone is kept so auction creation has a bootstrap identity
-      // before any seat exists.)
+      // An admin, or anyone an admin seated as an auctioneer.
       function isOwner() {
-        return request.auth != null
-          && (auction().ownerUid == request.auth.uid || (hasSeat() && seat().role == 'owner'));
+        return isAdmin() || (hasSeat() && seat().role == 'owner');
       }
 
       function isBidder() {
@@ -69,11 +81,11 @@ service cloud.firestore {
       }
 
       allow get: if request.auth != null;
-      // No `list` on the auction collection itself — auctions are only ever
-      // opened by a known id (from a URL), never enumerated.
-      allow list: if false;
+      // Only an admin enumerates auctions (the admin panel's auction list).
+      // A participant only ever opens one by id, from a link.
+      allow list: if isAdmin();
 
-      allow create: if request.auth != null
+      allow create: if isAdmin()
         && request.resource.data.ownerUid == request.auth.uid
         && request.resource.data.nextSeq == 0
         && request.resource.data.startedAt == null
@@ -84,7 +96,7 @@ service cloud.firestore {
         && request.resource.data.ownerUid == resource.data.ownerUid
         && request.resource.data.createdAt == resource.data.createdAt
         // seq only ever moves forward; mirror fields (name/startedAt/
-        // auctionLength/showResults) are cosmetic and owner-trusted.
+        // auctionLength/showResults/ownerPublicKey) are cosmetic and owner-trusted.
         && request.resource.data.nextSeq >= resource.data.nextSeq
         // rules are frozen once the auction has actually started.
         && (resource.data.startedAt == null || request.resource.data.config == resource.data.config)
@@ -196,14 +208,14 @@ service cloud.firestore {
 
       // ---- seats/{email} : who may occupy which slot ----------------------
       //
-      // The access-control table, keyed by the invited address so that a
+      // The access-control table, keyed by the participant's address so that a
       // sign-in token can be checked against it directly. Deleting a seat is
-      // how the auctioneer revokes someone; creating one under a different
-      // address is how they correct a typo in an invitation.
+      // how an admin revokes someone; creating one under a different address is
+      // how they correct a typo.
       //
       // A seat is as sensitive as an identity — `{email: supplier}` is exactly
       // the mapping the auction exists to hide — so a supplier may read only
-      // their own, and only the auctioneer may enumerate them. Note the read
+      // their own, and only an auctioneer may enumerate them. Note the read
       // rule matches on the address rather than on `hasSeat()`: someone whose
       // seat was revoked still needs to be able to establish that fact.
       match /seats/{email} {
@@ -215,19 +227,27 @@ service cloud.firestore {
           && request.resource.data.keys().hasOnly(['publicKey', 'role', 'invitedAt'])
           && request.resource.data.role in ['owner', 'bidder', 'viewer'];
 
-        // The seat holder stamps their own first sign-in, so the auctioneer's
-        // roster can distinguish "invited" from "has actually got in" — the
-        // question they need answered in the minutes before an auction opens.
-        // Nothing else about a seat may be changed by its holder: the slot and
-        // the role it grants stay exactly as the auctioneer wrote them.
+        // The seat holder stamps their own first sign-in, so the roster can
+        // distinguish "invited" from "has actually got in". Nothing else about
+        // a seat may be changed by its holder: the slot and the role it grants
+        // stay exactly as the auctioneer wrote them.
         allow update: if request.auth != null
           && 'email' in request.auth.token
           && request.auth.token.email == email
-          && request.auth.token.email_verified == true
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['claimedUid', 'claimedAt'])
           && request.resource.data.claimedUid == request.auth.uid;
 
         allow delete: if isOwner();
+      }
+
+      // ---- credentials/{publicKey} : generated participant passwords ------
+      //
+      // The admin panel creates each supplier/client account with a generated
+      // password and keeps it here so either admin can re-read and relay it
+      // later. Closed to everyone but an admin: a participant must never read
+      // another's password, and a viewer has no business here at all.
+      match /credentials/{publicKey} {
+        allow read, write: if isAdmin();
       }
     }
   }

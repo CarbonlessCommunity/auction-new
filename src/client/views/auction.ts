@@ -1,4 +1,4 @@
-import { auctionUrl, Connection, type RosterEntry } from '../connection';
+import { Connection, type RosterEntry } from '../connection';
 import { signOutNow } from '../auth';
 import { renderSignIn } from './signin';
 import type { AuctionAggregate, StoredLot, StoredUser } from '../../shared/aggregate';
@@ -8,7 +8,7 @@ import { bidderColor, escapeHtml, formatClock, formatValue, patch, toast } from 
 import { exportBidsCsv, exportResultsCsv } from '../export';
 import { BidChart } from './chart';
 
-type Panel = 'lot' | 'person' | 'people' | 'rules' | null;
+type Panel = 'lot' | 'people' | 'rules' | null;
 
 /** The live auction screen: board, clock, owner tools and chart. */
 export function renderAuction(root: HTMLElement, auctionId: string): void {
@@ -112,7 +112,6 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       buttons.push(`<button class="primary" data-act="release">Release results to everyone</button>`);
     }
 
-    buttons.push('<button data-act="panel-person">Invite participant</button>');
     buttons.push(`<button data-act="panel-people">People (${agg.users.size})</button>`);
     buttons.push('<button data-act="export-results">Download results (CSV)</button>');
     buttons.push('<button data-act="export-bids">Download bid log (CSV)</button>');
@@ -149,42 +148,15 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       return;
     }
 
-    if (panel === 'person') {
-      el.panel.innerHTML = `
-        <form class="card panel" data-form="person">
-          <h3>Invite a participant</h3>
-          <div class="row">
-            <input class="grow" name="name" data-k="person-name" placeholder="Firm or person" required />
-            <input class="grow" name="email" type="email" data-k="person-email"
-                   placeholder="them@theirfirm.com" required />
-            <select name="role" style="width:auto">
-              <option value="bidder">${roleLabel('bidder')}</option>
-              <option value="viewer">${roleLabel('viewer')}</option>
-              <option value="owner">${roleLabel('owner')}</option>
-            </select>
-            <button class="primary">Invite</button>
-          </div>
-          <p class="muted" style="font-size:0.85rem;margin:0.6rem 0 0">
-            They get a sign-in link at that address, and that address is the only
-            way in — a forwarded link signs nobody else in. Each supplier is
-            assigned a colour as you add them, and that colour is all the other
-            suppliers ever see of them: names appear on your screen and the
-            client's, never on a rival's.
-          </p>
-        </form>`;
-      return;
-    }
-
     if (panel === 'people') {
       el.panel.innerHTML = `
         <div class="card panel">
           <h3>People</h3>
           ${roster === null ? '<p class="muted">Loading…</p>' : rosterTable(roster)}
           <p class="hint">
-            Everyone here signs in with their own email address, and sees only
-            what their role allows. A supplier's colour is the only thing the
-            other suppliers see of them — names and addresses appear on this
-            screen, on the client's, and in the CSV downloads.
+            Add, remove and re-credential participants from the admin panel.
+            Everyone signs in with their own address; a supplier's colour is the
+            only thing the other suppliers see of them.
           </p>
         </div>`;
       return;
@@ -233,21 +205,13 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
           entry.role === 'bidder'
             ? `<span class="swatch" style="background:${bidderColor(entry.colorIndex)}"></span>`
             : '';
-        const status = entry.email === null
-          ? '<span class="status is-revoked">access removed</span>'
-          : entry.signedInAt !== null
-            ? '<span class="status is-in">signed in</span>'
-            : '<span class="status is-waiting">not signed in yet</span>';
-
-        const actions = entry.email === null
-          ? `<button class="link" data-act="reassign" data-key="${entry.publicKey}" data-email="">invite someone</button>`
-          : `<button class="link" data-act="resend" data-email="${escapeHtml(entry.email)}">send link</button>
-             <button class="link" data-act="reassign" data-key="${entry.publicKey}" data-email="${escapeHtml(entry.email)}">change email</button>
-             ${
-               entry.isYou
-                 ? ''
-                 : `<button class="link danger" data-act="revoke" data-email="${escapeHtml(entry.email)}" data-name="${escapeHtml(entry.name)}">remove</button>`
-             }`;
+        const status = entry.role === 'owner'
+          ? ''
+          : entry.email === null
+            ? '<span class="status is-revoked">access removed</span>'
+            : entry.signedInAt !== null
+              ? '<span class="status is-in">signed in</span>'
+              : '<span class="status is-waiting">not signed in yet</span>';
 
         return `
           <li class="roster-row">
@@ -258,7 +222,6 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
               <br /><span class="muted">${escapeHtml(entry.email ?? 'no address')}</span>
             </span>
             ${status}
-            <span class="roster-actions">${actions}</span>
           </li>`;
       })
       .join('');
@@ -417,11 +380,10 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     // remedy is a form rather than an apology.
     if (connection.needsSignIn) {
       renderSignIn(root, {
-        continueUrl: auctionUrl(auctionId),
         heading: 'Sign in to this auction',
         blurb:
-          'Enter the email address the auctioneer invited. Which screen you get — ' +
-          'auctioneer, supplier or client — follows from who you are, not from the link you were sent.',
+          'Use the email address and password your auctioneer gave you. Which screen you ' +
+          'get — auctioneer, supplier or client — follows from who you are.',
         onSignedIn: () => location.reload(),
       });
       return;
@@ -581,45 +543,6 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       return;
     }
 
-    if (act === 'resend') {
-      const email = target.dataset.email!;
-      const result = await connection.sendInvite(email);
-      toast(result.ok ? `Sign-in link sent to ${email}.` : result.error ?? 'Could not send the link.',
-        result.ok ? 'info' : 'error');
-      return;
-    }
-
-    if (act === 'reassign') {
-      const oldEmail = target.dataset.email ?? '';
-      const next = prompt('Which email address should hold this place?', oldEmail);
-      if (!next) return;
-      const result = await connection.reassignSeat(target.dataset.key!, oldEmail, next);
-      if (!result.ok) {
-        toast(result.error ?? 'Could not change the address.', 'error');
-        return;
-      }
-      // Moving a seat only grants access; it does not announce itself. Send the
-      // link too, or the new address has no idea it is expected.
-      await connection.sendInvite(next);
-      toast(`Sign-in link sent to ${next}.`);
-      await refreshRoster();
-      return;
-    }
-
-    if (act === 'revoke') {
-      const email = target.dataset.email!;
-      const name = target.dataset.name!;
-      if (!confirm(`Remove ${name}'s access? They are signed out immediately. Any bids they have already placed stay on the board.`)) return;
-      const result = await connection.revokeSeat(email);
-      if (!result.ok) {
-        toast(result.error ?? 'Could not remove access.', 'error');
-        return;
-      }
-      toast(`${name} can no longer sign in.`);
-      await refreshRoster();
-      return;
-    }
-
     if (act === 'export-results') {
       if (connection.agg) exportResultsCsv(connection.agg);
       return;
@@ -658,26 +581,6 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       await submit({ type: 'addLot', name: String(data.get('name')) }, () => {
         panel = null;
       });
-    } else if (kind === 'person') {
-      const email = String(data.get('email'));
-      await submit(
-        {
-          type: 'addUser',
-          name: String(data.get('name')),
-          role: data.get('role') as Role,
-          email,
-        },
-        async () => {
-          panel = 'people';
-          // Seating them is what grants access; this is what tells them so.
-          const sent = await connection.sendInvite(email);
-          toast(
-            sent.ok ? `Sign-in link sent to ${email}.` : `Added, but the link could not be sent: ${sent.error}`,
-            sent.ok ? 'info' : 'error',
-          );
-          await refreshRoster();
-        },
-      );
     } else if (kind === 'rules') {
       const body = {
         bidDirection: data.get('bidDirection') as BidDirection,

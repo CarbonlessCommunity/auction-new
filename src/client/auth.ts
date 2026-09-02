@@ -1,43 +1,31 @@
+import { initializeApp, deleteApp } from 'firebase/app';
 import {
-  isSignInWithEmailLink,
+  connectAuthEmulator,
+  createUserWithEmailAndPassword,
+  initializeAuth,
+  inMemoryPersistence,
   onAuthStateChanged,
-  sendSignInLinkToEmail,
-  signInWithEmailLink,
+  sendEmailVerification,
+  signInWithEmailAndPassword,
   signOut,
+  updatePassword,
   type User,
 } from 'firebase/auth';
-import { auth } from './firebase';
+import { auth, firebaseConfig, usingEmulator } from './firebase';
 
 /**
- * Passwordless email-link sign-in — the app's whole notion of "who is this".
+ * Email/password sign-in — the app's whole notion of "who is this".
  *
- * The previous model bound a slot to an *anonymous* Firebase uid the first time
- * someone opened an invite URL. That had two problems the auction could not
- * live with: the link was a bearer token (whoever it was forwarded to became
- * that supplier), and the binding was to a browser, so clearing cookies or
- * switching laptop locked a supplier out of a live auction with no way back in.
+ * Every participant has an account with an address and a password. The two
+ * admins (see `src/shared/admins.ts`) sign in with their own address and run
+ * the auctions; every supplier and client account is *created by an admin* from
+ * the admin panel, with a generated password the admin relays out of band.
  *
- * Here a participant proves control of the email address the auctioneer
- * invited. Firebase issues the same uid for a given address on every device, so
- * signing in again — anywhere, any number of times — lands on the same seat,
- * and `firestore.rules` can key access off `request.auth.token.email` rather
- * than a secret in a URL.
+ * Nothing is emailed by the app. An earlier design used Firebase's passwordless
+ * email-link sign-in, but the Spark plan caps those at five per day per project
+ * — far too few to seat a real auction — and the cap is tied to the plan, not
+ * to the mail transport, so no amount of SMTP configuration lifts it.
  */
-
-/**
- * Where the email address is parked between sending the link and following it.
- * Firebase requires the address at completion to stop a link intercepted in
- * transit from being redeemed by someone else. When the link was sent from
- * *another* browser — the auctioneer inviting a supplier — nothing is stored
- * here and the caller has to ask for it; see {@link pendingEmail}.
- */
-const PENDING_EMAIL_KEY = 'auction:pendingEmail';
-
-export const pendingEmail = {
-  get: () => localStorage.getItem(PENDING_EMAIL_KEY),
-  set: (email: string) => localStorage.setItem(PENDING_EMAIL_KEY, email),
-  clear: () => localStorage.removeItem(PENDING_EMAIL_KEY),
-};
 
 /** Firebase lowercases addresses on the token; match that everywhere we key off one. */
 export function normalizeEmail(email: string): string {
@@ -49,54 +37,122 @@ export interface AuthResult {
   error?: string;
 }
 
-/**
- * Emails a sign-in link that returns the recipient to `continueUrl`.
- *
- * Callable for any address, not just the current browser's — that is what lets
- * the auctioneer (re)send a supplier's invitation from the roster screen. The
- * address is only remembered locally when we are inviting ourselves, since a
- * stored address from an unrelated invite would be the wrong one to complete
- * with later.
- */
-export async function sendSignInLink(email: string, continueUrl: string, remember: boolean): Promise<AuthResult> {
-  const address = normalizeEmail(email);
+/** Signs this browser in as an existing account. */
+export async function signIn(email: string, password: string): Promise<AuthResult> {
   try {
-    await sendSignInLinkToEmail(auth, address, { url: continueUrl, handleCodeInApp: true });
-    if (remember) pendingEmail.set(address);
+    await signInWithEmailAndPassword(auth, normalizeEmail(email), password);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: describeAuthError(err) };
   }
 }
 
-/** True when this page load is a click on a sign-in link. */
-export function isSignInLink(): boolean {
-  return isSignInWithEmailLink(auth, location.href);
-}
-
 /**
- * Completes a sign-in link click. Returns `needsEmail` when the link was opened
- * on a device that never sent it (the auctioneer-sent case), in which case the
- * caller must collect the address and call {@link completeSignInWithEmail}.
+ * First-time setup for an admin: creates their account and sends the one
+ * address-verification email they need to click. `firestore.rules` requires a
+ * *verified* address for admin powers — otherwise anyone could register an
+ * admin address here and walk straight in.
  */
-export async function completeSignIn(): Promise<AuthResult & { user?: User; needsEmail?: boolean }> {
-  if (!isSignInLink()) return { ok: false, error: 'Not a sign-in link.' };
-  const stored = pendingEmail.get();
-  if (!stored) return { ok: false, needsEmail: true };
-  return completeSignInWithEmail(stored);
-}
-
-export async function completeSignInWithEmail(email: string): Promise<AuthResult & { user?: User }> {
+export async function createStaffAccount(email: string, password: string): Promise<AuthResult> {
   try {
-    const credential = await signInWithEmailLink(auth, normalizeEmail(email), location.href);
-    pendingEmail.clear();
-    // The link carries a single-use code; leaving it in the address bar means a
-    // refresh tries to redeem it again and fails with a confusing error.
-    history.replaceState(null, '', location.pathname);
-    return { ok: true, user: credential.user };
+    const credential = await createUserWithEmailAndPassword(auth, normalizeEmail(email), password);
+    await sendEmailVerification(credential.user);
+    return { ok: true };
   } catch (err) {
     return { ok: false, error: describeAuthError(err) };
   }
+}
+
+/** Re-sends the admin verification email, for the "check your inbox" state. */
+export async function resendStaffVerification(): Promise<AuthResult> {
+  if (!auth.currentUser) return { ok: false, error: 'Sign in first.' };
+  try {
+    await sendEmailVerification(auth.currentUser);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: describeAuthError(err) };
+  }
+}
+
+export interface ParticipantAccountResult extends AuthResult {
+  uid?: string;
+  /** True when the address already had an account — seat it, don't recreate it. */
+  preexisting?: boolean;
+}
+
+/**
+ * Creates a participant's account without disturbing the admin's own session.
+ *
+ * `createUserWithEmailAndPassword` signs in as the account it just made, so it
+ * is run on a throwaway secondary Firebase app with in-memory persistence: the
+ * primary app (where the admin is signed in) never sees it, and the secondary
+ * is torn down immediately afterwards.
+ */
+export async function createParticipantAccount(
+  email: string,
+  password: string,
+): Promise<ParticipantAccountResult> {
+  const address = normalizeEmail(email);
+  const secondary = initializeApp(firebaseConfig, `mk-${crypto.randomUUID()}`);
+  try {
+    const secondaryAuth = initializeAuth(secondary, { persistence: inMemoryPersistence });
+    if (usingEmulator) {
+      connectAuthEmulator(secondaryAuth, 'http://127.0.0.1:9099', { disableWarnings: true });
+    }
+    const credential = await createUserWithEmailAndPassword(secondaryAuth, address, password);
+    await signOut(secondaryAuth);
+    return { ok: true, uid: credential.user.uid };
+  } catch (err) {
+    const code = (err as { code?: string } | null)?.code ?? '';
+    if (code === 'auth/email-already-in-use') {
+      return { ok: false, preexisting: true, error: `${address} already has an account.` };
+    }
+    return { ok: false, error: describeAuthError(err) };
+  } finally {
+    await deleteApp(secondary).catch(() => {});
+  }
+}
+
+/**
+ * Sets a new password on a participant's account, on a throwaway secondary app.
+ *
+ * Client-only Firebase can only change a password while signed in *as* that
+ * account, so this signs in with the password the admin panel has on file. If
+ * the participant has since changed their own password this fails, and the
+ * remedy is to remove and re-add them.
+ */
+export async function setParticipantPassword(
+  email: string,
+  currentPassword: string,
+  newPassword: string,
+): Promise<AuthResult> {
+  const address = normalizeEmail(email);
+  const secondary = initializeApp(firebaseConfig, `pw-${crypto.randomUUID()}`);
+  try {
+    const secondaryAuth = initializeAuth(secondary, { persistence: inMemoryPersistence });
+    if (usingEmulator) {
+      connectAuthEmulator(secondaryAuth, 'http://127.0.0.1:9099', { disableWarnings: true });
+    }
+    const credential = await signInWithEmailAndPassword(secondaryAuth, address, currentPassword);
+    await updatePassword(credential.user, newPassword);
+    await signOut(secondaryAuth);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: describeAuthError(err) };
+  } finally {
+    await deleteApp(secondary).catch(() => {});
+  }
+}
+
+/** A legible generated password: four groups of four unambiguous characters. */
+export function generatePassword(): string {
+  const alphabet = '23456789abcdefghjkmnpqrstuvwxyz';
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  const chars = Array.from(bytes, (byte) => alphabet[byte % alphabet.length]);
+  return [chars.slice(0, 4), chars.slice(4, 8), chars.slice(8, 12), chars.slice(12, 16)]
+    .map((group) => group.join(''))
+    .join('-');
 }
 
 /** Resolves with the signed-in user, or null — waits out Firebase's initial restore. */
@@ -114,31 +170,45 @@ export function currentUser(): Promise<User | null> {
 }
 
 export async function signOutNow(): Promise<void> {
-  pendingEmail.clear();
   await signOut(auth);
 }
 
 /**
- * A supplier who cannot get in mid-auction needs to know *why* in the words of
- * the thing they just did, not a Firebase error code.
+ * Refreshes the cached user record *and* forces a new ID token, so a just-
+ * clicked verification link is reflected both on `user.emailVerified` and in
+ * the `email_verified` claim that `firestore.rules` reads.
+ */
+export async function reloadUser(): Promise<void> {
+  if (!auth.currentUser) return;
+  await auth.currentUser.reload();
+  await auth.currentUser.getIdToken(true);
+}
+
+/**
+ * A participant who cannot get in needs to know *why* in plain words, not a
+ * Firebase error code.
  */
 function describeAuthError(err: unknown): string {
   const code = (err as { code?: string } | null)?.code ?? '';
   switch (code) {
     case 'auth/invalid-email':
       return 'That does not look like an email address.';
-    case 'auth/invalid-action-code':
-    case 'auth/expired-action-code':
-      return 'That sign-in link has expired or has already been used. Ask for a new one.';
+    case 'auth/invalid-credential':
+    case 'auth/wrong-password':
+    case 'auth/user-not-found':
+      return 'Wrong email or password.';
     case 'auth/user-disabled':
       return 'That account has been disabled.';
+    case 'auth/email-already-in-use':
+      return 'That address already has an account.';
+    case 'auth/weak-password':
+      return 'That password is too weak — use at least six characters.';
     case 'auth/too-many-requests':
       return 'Too many attempts. Wait a minute and try again.';
-    case 'auth/unauthorized-continue-uri':
-    case 'auth/invalid-continue-uri':
-      return 'This site is not on the project’s authorised domains — add it under Authentication → Settings in the Firebase console.';
+    case 'auth/network-request-failed':
+      return 'Network problem — check your connection and try again.';
     case 'auth/operation-not-allowed':
-      return 'Email link sign-in is switched off for this Firebase project — enable it under Authentication → Sign-in method.';
+      return 'Email/password sign-in is switched off for this Firebase project — enable it under Authentication → Sign-in method.';
     default:
       return err instanceof Error ? err.message : 'Could not sign in.';
   }

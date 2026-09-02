@@ -37,6 +37,10 @@ interface Person {
 }
 
 const OWNER: Person = { uid: 'uid-owner', email: 'organiser@example.com' };
+/** An admin address (mirrors `isAdmin()` in firestore.rules / src/shared/admins.ts). */
+const ADMIN: Person = { uid: 'uid-admin', email: 'jeffreyhuang165@gmail.com' };
+/** The same admin address on a token that never proved it. */
+const ADMIN_UNVERIFIED: Person = { uid: 'uid-admin-2', email: ADMIN.email, verified: false };
 const ALICE: Person = { uid: 'uid-alice', email: 'alice@example.com' };
 const BOB: Person = { uid: 'uid-bob', email: 'bob@example.com' };
 const DAVE: Person = { uid: 'uid-dave', email: 'dave@example.com' }; // observer, buying side
@@ -210,6 +214,66 @@ describe('admin events are owner-only', () => {
   it('refuses an unknown event type even from the owner', async () => {
     const db = as(OWNER);
     await assertFails(setDoc(eventRef(db, 10), adminEvent({ type: 'grantMyselfEverything' })));
+  });
+});
+
+/**
+ * The two admins run every auction. They resolve to the `owner` role straight
+ * from their verified address — no seat — and are the only ones who may create
+ * an auction, enumerate auctions, or read a participant's stored password.
+ */
+describe('admins', () => {
+  const credentialDoc = (db: ReturnType<typeof as>, key: string) =>
+    doc(db, 'auctions', AUCTION, 'credentials', key);
+
+  for (const type of ['setName', 'addUser', 'addLot', 'renameLot', 'startAuction', 'showResults']) {
+    it(`lets an admin write ${type} with no seat of their own`, async () => {
+      await assertSucceeds(setDoc(eventRef(as(ADMIN), 10), adminEvent({ type })));
+    });
+  }
+
+  it('lets an admin enumerate auctions; refuses everyone else', async () => {
+    await assertSucceeds(getDocs(collection(as(ADMIN), 'auctions')));
+    await assertFails(getDocs(collection(as(ALICE), 'auctions')));
+    await assertFails(getDocs(collection(as(STRANGER), 'auctions')));
+  });
+
+  it('lets an admin create an auction; refuses a non-admin', async () => {
+    const fresh = (uid: string) => ({
+      name: 'New', config: CONFIG, ownerUid: uid, ownerPublicKey: '0',
+      nextSeq: 0, startedAt: null, auctionLength: TOTAL_RUN, showResults: false, createdAt: nowSec(),
+    });
+    await assertSucceeds(setDoc(doc(as(ADMIN), 'auctions', 'new-a'), fresh(ADMIN.uid)));
+    await assertFails(setDoc(doc(as(ALICE), 'auctions', 'new-b'), fresh(ALICE.uid)));
+    await assertFails(setDoc(doc(as(STRANGER), 'auctions', 'new-c'), fresh(STRANGER.uid)));
+  });
+
+  it('lets only an admin read or write a stored password', async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await setDoc(doc(ctx.firestore(), 'auctions', AUCTION, 'credentials', ALICE_KEY), {
+        email: ALICE.email, password: 'k7m2-q9xh-3rtp-w4nd', preexisting: false, updatedAt: nowSec(),
+      });
+    });
+    await assertSucceeds(getDoc(credentialDoc(as(ADMIN), ALICE_KEY)));
+    await assertSucceeds(
+      setDoc(credentialDoc(as(ADMIN), BOB_KEY), {
+        email: BOB.email, password: 'aaaa-bbbb-cccc-dddd', preexisting: false, updatedAt: nowSec(),
+      }),
+    );
+    // A supplier must never read another's password — nor their own here.
+    await assertFails(getDoc(credentialDoc(as(ALICE), ALICE_KEY)));
+    await assertFails(getDoc(credentialDoc(as(BOB), ALICE_KEY)));
+    await assertFails(getDoc(credentialDoc(as(DAVE), ALICE_KEY)));
+    await assertFails(getDoc(credentialDoc(as(STRANGER), ALICE_KEY)));
+    await assertFails(getDocs(collection(as(ALICE), 'auctions', AUCTION, 'credentials')));
+  });
+
+  it('refuses admin powers to the admin address on an unverified token', async () => {
+    await assertFails(setDoc(eventRef(as(ADMIN_UNVERIFIED), 10), adminEvent({ type: 'setName' })));
+    await assertFails(getDocs(collection(as(ADMIN_UNVERIFIED), 'auctions')));
+    await assertFails(
+      getDoc(doc(as(ADMIN_UNVERIFIED), 'auctions', AUCTION, 'credentials', ALICE_KEY)),
+    );
   });
 });
 
@@ -446,13 +510,16 @@ describe('a seat is the whole of the access model', () => {
   });
 
   /**
-   * The check that makes the address trustworthy at all. Without it, any
-   * sign-in method that lets a caller *assert* an address would hand them
-   * whichever seat they named.
+   * A participant's address does NOT have to be verified: their account can
+   * only be created by an admin, so the admin is already the authority on which
+   * address maps to which seat. (An *admin* address still must be verified —
+   * see the `admins` block — because anyone could register one.)
    */
-  it('refuses a token carrying an unverified address', async () => {
-    await assertFails(setDoc(eventRef(as(ALICE_UNVERIFIED), 10), bid()));
-    await assertFails(getDoc(doc(as(ALICE_UNVERIFIED), 'auctions', AUCTION, 'identities', ALICE_KEY)));
+  it('accepts a seated participant on an unverified address', async () => {
+    await assertSucceeds(setDoc(eventRef(as(ALICE_UNVERIFIED), 10), bid()));
+    await assertSucceeds(
+      getDoc(doc(as(ALICE_UNVERIFIED), 'auctions', AUCTION, 'identities', ALICE_KEY)),
+    );
   });
 
   /** Anonymous sessions were the old model's currency; they buy nothing now. */
@@ -604,7 +671,7 @@ describe('collections that must never be enumerable', () => {
     await assertFails(getDocs(collection(db, 'auctions', AUCTION, 'users')));
   });
 
-  it('refuses enumerating auctions', async () => {
+  it('refuses a participant enumerating auctions', async () => {
     const db = as(ALICE);
     await assertFails(getDocs(collection(db, 'auctions')));
   });

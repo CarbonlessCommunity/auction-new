@@ -21,14 +21,16 @@ running a real auction.
 npm install && npm run dev
 ```
 
-Open the printed URL and fill in the auction settings. You confirm your email
-address once — a sign-in link arrives, and clicking it creates the auction and
-lands you on the board as the auctioneer. The People panel is where you invite
-each supplier and client by email.
+Open the printed URL. `/` is the **admin panel**, open only to the two addresses
+in [`src/shared/admins.ts`](src/shared/admins.ts); the first time, an admin sets
+their own password and clicks one verification email. From the panel an admin
+creates an auction and, per auction, creates each supplier's and client's
+email/password account — a password is generated and shown once, and the admin
+relays it (with the board link) out of band. **The app sends no email itself.**
 
 To drive both sides on one machine, run against the emulators
-(`npm run dev:emulator`), where no mail is actually sent: the sign-in links are
-served by the Auth emulator at
+(`npm run dev:emulator`). Verification/reset mail is not sent there; grab the
+link from the Auth emulator at
 `http://127.0.0.1:9099/emulator/v1/projects/<project-id>/oobCodes`.
 
 Then: **Add contract term** → **Start auction** → place bids as the suppliers →
@@ -62,12 +64,16 @@ themselves, so `brew install openjdk` is the only setup.
 
 Firebase config lives in [`src/client/firebase.ts`](src/client/firebase.ts) (a web
 API key is not a secret — access is governed entirely by
-[`firestore.rules`](firestore.rules)). The project needs **Email link
-(passwordless sign-in)** enabled under Authentication → Sign-in method — open
-the *Email/Password* provider and switch on "Email link" — and whatever domain
-you serve from listed under Authentication → Settings → Authorized domains.
-Every participant signs in with their own address; there is no other credential
-in the system.
+[`firestore.rules`](firestore.rules)). The project needs the
+**Email/Password** provider enabled under Authentication → Sign-in method, and
+whatever domain you serve from listed under Authentication → Settings →
+Authorized domains. Admin verification and password-reset mail goes out through
+Firebase Auth, so configure a custom SMTP sender under Authentication →
+Templates if the built-in one is unreliable for your recipients — but ordinary
+participant sign-in and provisioning send no mail at all.
+
+The admin addresses are hard-coded in both [`src/shared/admins.ts`](src/shared/admins.ts)
+and [`firestore.rules`](firestore.rules) (`isAdmin()`); change one, change the other.
 
 ## How it works
 
@@ -119,32 +125,39 @@ that go unnoticed long enough to distort the board.
 
 The UI renames each role rather than showing internal vocabulary.
 
-**A participant's identity is their verified email address**, established by
-Firebase's passwordless email-link sign-in. The auctioneer invites an address;
-that writes a *seat* at `auctions/{id}/seats/{email}` naming the slot and role it
-grants. A signed-in client's token carries the address, so `firestore.rules`
-resolves "who is this" by reading that one document — no query, and no secret in
-a URL.
+**A participant's identity is their email address.** Two admins (see
+[`src/shared/admins.ts`](src/shared/admins.ts)) run every auction; they sign in
+with email/password and are the `owner` of every auction, resolved straight from
+their *verified* address. Everyone else's account is created *by an admin* from
+the admin panel, with a generated password the admin relays out of band — which
+also writes a *seat* at `auctions/{id}/seats/{email}` naming the slot and role.
+A signed-in client's token carries the address, so `firestore.rules` resolves
+"who is this" by reading that one document — no query, and no secret in a URL.
+
+`email_verified` is required of an **admin** (an admin address is one anyone
+could register, so the inbox check is what makes it trustworthy) but **not** of
+a participant: a participant account can only be created by an admin, who is
+already the authority on which address maps to which seat.
 
 Consequences worth stating plainly, because they are the point:
 
-- **Nothing in a link grants access.** A forwarded invitation signs the
-  forwarder in as themselves, which gets them nowhere.
-- **A supplier can sign in again, on any device, as often as they like.** Losing
-  a session mid-auction is a nuisance rather than a catastrophe; "send link"
-  from the roster is the whole remedy.
+- **Nothing in a link grants access.** The board URL is not a credential; a
+  forwarded one signs the recipient in as themselves, which gets them nowhere.
+- **A participant can sign in again, on any device, as often as they like.** An
+  admin can also issue a new password from the panel at any time.
 - **Revoking is immediate.** Deleting the seat cuts access off on whatever
   device the person is already using, because every rule resolves through it.
 
-The auctioneer's **People** panel is the operational view of this: every
-participant, their address, whether they have actually signed in yet, and
-buttons to resend a link, correct a mistyped address, or remove access.
+The admin panel is the operational view of this: every participant, their
+address, whether they have actually signed in yet, the password on file, and
+buttons to re-credential, correct a mistyped address, or remove access. The
+board's own **People** panel is read-only.
 
-(An earlier design bound a slot to the first browser that opened a bearer invite
-link. It could not tell a supplier from whoever they forwarded the link to, and
-a supplier who cleared their cookies was locked out with no recovery path at
-all. Both problems are structural to bearer links, which is why this replaced
-them rather than patching them.)
+(Earlier designs used a bearer invite link, then a passwordless email-link
+sign-in. The link bound a slot to one browser and could not tell a supplier
+from whoever they forwarded it to; the email-link flow is capped by Firebase at
+five sends a day on the free plan, far too few to seat a real auction. Both were
+replaced rather than patched.)
 
 ### Anonymity
 
@@ -236,8 +249,9 @@ With no backend, the browser is the only thing running `validateInbound`, and
 bypass. The rules enforce what a client can *prove* from its own uid and document
 reads:
 
-- only the real owner can issue admin events;
-- a supplier cannot read another supplier's name or email by any route;
+- only an admin (a hard-coded, *verified* address) can create an auction, issue
+  admin events, seat or unseat anyone, or read a participant's stored password;
+- a supplier cannot read another supplier's name, email or password by any route;
 - a supplier can bid only as itself, and cannot forge the `placedBy` marker that
   denotes an auctioneer bidding on someone's behalf;
 - a supplier can withdraw only their own bid, and the watching client can write
@@ -245,9 +259,9 @@ reads:
 - events are append-only and gapless — no overwrite, no delete, no seq gaps;
 - a supplier's paired clock bump is bounded, so it can neither end the auction
   early nor stall it;
-- only the auctioneer can seat or unseat anyone, a seat holder can change
-  nothing about their own seat but the sign-in stamp, and an address that was
-  never verified resolves to no seat at all.
+- a seat holder can change nothing about their own seat but the sign-in stamp.
+  A participant's address need not be verified (only an admin can create the
+  account), but an *admin* address on an unverified token gets no admin powers.
 
 What they cannot enforce, and what is therefore **cosmetic rather than secret**:
 
@@ -279,7 +293,7 @@ as explicit tests so a future change that closes one is noticed.
 | Runtime | Python 2.7 on App Engine | Static TypeScript SPA, no server to run |
 | Realtime | 2-second polling | Firestore snapshot listeners |
 | Storage | `pickle`d validator state in the datastore | Firestore event log; state is always re-derivable |
-| Auth | Private key in the URL | Firebase email-link sign-in; access keyed to the verified address |
+| Auth | Private key in the URL | Firebase email/password; two admins run everything, each participant account admin-provisioned |
 | Rules | Hardcoded constants in `validation.py` | Per-auction config, editable before start |
 | Direction | Reverse only | Reverse or forward |
 | Input | `window.prompt` / `window.confirm` | Inline forms, live validation |
@@ -290,10 +304,11 @@ as explicit tests so a future change that closes one is noticed.
 ## Layout
 
 ```
-src/shared/     types, rules, config, schemas, aggregate, validation
-src/client/     firebase, auth (email-link sign-in), connection (transactional
-                append + listeners + seats), views (sign-in, create, auction
-                board, chart), export, format
+src/shared/     types, rules, config, schemas, aggregate, validation, admins
+src/client/     firebase, auth (email/password + secondary-app account
+                provisioning), connection (transactional append + listeners +
+                seats + participant management), views (sign-in, create, admin
+                panel, auction board, chart), export, format
 firestore.rules the enforcement boundary — read the header comment
 tests/          domain rules, bid comparison, validation
 tests/rules/    security rules, against the emulator
@@ -301,10 +316,17 @@ tests/rules/    security rules, against the emulator
 
 ## Notes
 
-- **Invitations are sent by Firebase Auth**, not by the app: the "email" a
-  participant receives is the sign-in link itself. There is no separate
-  invitation message, and nothing to compose. The auctioneer's People panel
-  triggers and re-triggers them.
+- **The app sends no email.** An admin creates each participant's account with a
+  generated password and relays it (with the board link) however they like. The
+  only mail Firebase sends is an admin's one-time address verification and any
+  password reset an admin triggers on their own account — configure a custom
+  SMTP sender under Authentication → Templates if the built-in one is
+  unreliable.
+- **Participant accounts are created on a throwaway secondary Firebase app** so
+  the admin's own session is never disturbed. A leftover Firebase Auth account
+  after a revoke is harmless — no seat, no access.
+- **Password reset from the panel** works only while the password on file is
+  current; if a participant changed their own, remove and re-add them.
 - **Clock skew** is not corrected: countdowns come from each browser's own
   `Date.now()`, so a badly-set machine will disagree by its own offset. The
   security rules allow a 5-second grace window on the deadline for this reason.
