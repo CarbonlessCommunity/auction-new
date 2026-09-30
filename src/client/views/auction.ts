@@ -6,7 +6,7 @@ import type { AuctionAggregate, StoredLot, StoredUser } from '../../shared/aggre
 import type { AuctionPhase, BidDirection, Role } from '../../shared/types';
 import { MAX_BIDDERS, MAX_LOTS } from '../../shared/rules';
 import { auditLog } from '../../shared/audit';
-import { bidderColor, escapeHtml, formatAgo, formatClock, formatValue, patch, toast } from '../format';
+import { bidderColor, escapeHtml, formatClock, formatValue, patch, toast } from '../format';
 import { exportBidsCsv, exportResultsCsv } from '../export';
 import type { BidChart } from './chart';
 import { presenceStatus } from './presence';
