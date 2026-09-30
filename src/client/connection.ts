@@ -660,15 +660,21 @@ export class Connection {
    * an event), so the view calls this again whenever the phase flips.
    */
   refold(): void {
-    const config = this.auctionData?.config ?? this.auction?.config;
-    if (!config || !this.you) return;
+    const agg = this.foldFor(this.rawEvents);
+    if (agg) this.agg = agg;
+  }
 
-    const truth = AuctionAggregate.replay(this.auctionId, config, this.rawEvents);
+  /** `refold`, over any log — `submit` uses it on the log as it stands mid-transaction. */
+  private foldFor(events: AuctionEvent[]): AuctionAggregate | null {
+    const config = this.auctionData?.config ?? this.auction?.config;
+    if (!config || !this.you) return null;
+
+    const truth = AuctionAggregate.replay(this.auctionId, config, events);
     const viewer: Participant = { publicKey: this.you.publicKey, role: this.you.role };
     const now = this.now();
 
     const visible: AuctionEvent[] = [];
-    for (const event of this.rawEvents) {
+    for (const event of events) {
       const filtered = filterOutbound(truth, event, viewer, now);
       if (filtered) visible.push(filtered);
     }
@@ -678,7 +684,7 @@ export class Connection {
     // docs Firestore actually let this viewer read, so a supplier's board can
     // never name a rival however the client is tampered with.
     for (const [publicKey, name] of this.identities) agg.revealName(publicKey, name);
-    this.agg = agg;
+    return agg;
   }
 
   /**
@@ -761,6 +767,8 @@ export class Connection {
         : null;
 
     const draft = validated.event;
+    /** The event as it actually landed — re-validated inside the transaction if the log had moved. */
+    let appended: AuctionEvent | null = null;
     let invitedEmail: string | undefined;
 
     // A seat is keyed by address, so two participants cannot share one — the
@@ -781,7 +789,29 @@ export class Connection {
         const snap = await tx.get(aRef);
         if (!snap.exists()) throw new Error('No such auction.');
         const seq = (snap.data() as AuctionDocData).nextSeq;
-        const event: AuctionEvent = { ...draft, seq };
+        let event: AuctionEvent = { ...draft, seq };
+
+        // The check above ran against the board as this browser last saw it.
+        // If anything has landed since — the log is gapless, so that is
+        // exactly the events numbered from what we hold up to `seq` — read
+        // them here, inside the transaction, and judge the bid again against
+        // the board as it actually stands. Otherwise two suppliers answering
+        // the same price in the same second both pass, and the second to land
+        // does not beat the first: legal on every screen, wrong in the audit.
+        const isBid = event.type === 'placeBid' || event.type === 'cancelBid';
+        if (isBid && seq > this.rawEvents.length) {
+          const landed: AuctionEvent[] = [];
+          for (let s = this.rawEvents.length; s < seq; s += 1) {
+            const doc = await tx.get(eventRef(this.auctionId, s));
+            if (doc.exists()) landed.push(doc.data() as AuctionEvent);
+          }
+          const current = this.foldFor([...this.rawEvents, ...landed]);
+          if (current) {
+            const again = validateInbound(current, parsed.input, actor, this.now(), seq);
+            if (!again.ok) throw new Error(again.error);
+            event = again.event;
+          }
+        }
 
         tx.set(eventRef(this.auctionId, seq), event);
         tx.update(aRef, { nextSeq: seq + 1, ...mirrorUpdate(event) });
@@ -807,13 +837,13 @@ export class Connection {
           invitedEmail = address;
         }
 
-        draft.seq = seq;
+        appended = event;
       });
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : 'Request failed.' };
     }
 
-    return { ok: true, event: draft, ...(invitedEmail ? { invitedEmail } : {}) };
+    return { ok: true, event: appended ?? draft, ...(invitedEmail ? { invitedEmail } : {}) };
   }
 
   // --- participant management (admin only) -------------------------------

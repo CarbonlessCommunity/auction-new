@@ -10,3 +10,6 @@ dist/
 firebase-debug.log
 firestore-debug.log
 ui-debug.log
+
+# Local preview configs for the Claude desktop app
+.claude/

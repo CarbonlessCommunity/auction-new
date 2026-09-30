@@ -7,7 +7,7 @@ import { MAX_BIDDERS, MAX_LOTS } from '../../shared/rules';
 import { auditLog } from '../../shared/audit';
 import { bidderColor, escapeHtml, formatAgo, formatClock, formatValue, patch, toast } from '../format';
 import { exportBidsCsv, exportResultsCsv } from '../export';
-import { BidChart } from './chart';
+import type { BidChart } from './chart';
 import { presenceStatus } from './presence';
 
 type Panel = 'lot' | 'people' | 'rules' | 'audit' | null;
@@ -64,6 +64,9 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
   };
 
   let chart: BidChart | null = null;
+  let chartLoading: Promise<void> | null = null;
+  /** The contract term whose name is being edited inline, if any. */
+  let renamingLot: string | null = null;
   let panel: Panel = null;
   let phaseKey = '';
   let rulesDismissed = false;
@@ -222,8 +225,8 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
           <p class="hint">
             Replays the whole log through the same validator every screen uses and lists
             anything it would have refused. Bid arithmetic is enforced only in the
-            submitting browser, so an entry here means a write that bypassed it — or two
-            bids landing in the same instant, or a badly set clock. Everything listed
+            submitting browser, so an entry here means a write that bypassed it, or a
+            badly set clock. Everything listed
             still stands on the board — withdraw it if it should not.
           </p>
         </div>`;
@@ -486,12 +489,20 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
             bidding && !lockedOut ? ' — bid again to lead' : ''
           }</p>`;
 
+    const canRename = isOwner() && agg.startTime === null;
+    const header =
+      canRename && renamingLot === lot.id
+        ? `<form class="bidform" data-form="rename" data-lot="${lot.id}">
+             <input name="name" value="${escapeHtml(lot.name)}" data-k="rename-${lot.id}" required maxlength="120" />
+             <button class="primary">Save</button>
+             <button type="button" class="link" data-act="rename-cancel">cancel</button>
+           </form>`
+        : `<h2>${escapeHtml(lot.name)}</h2>
+           ${canRename ? `<button class="link" data-act="rename" data-lot="${lot.id}">rename</button>` : ''}`;
+
     return `
       <section class="term ${since === undefined ? '' : 'is-outbid'}" data-lot="${lot.id}">
-        <header>
-          <h2>${escapeHtml(lot.name)}</h2>
-          ${isOwner() && agg.startTime === null ? `<button class="link" data-act="rename" data-lot="${lot.id}">rename</button>` : ''}
-        </header>
+        <header>${header}</header>
         ${outbidNote}
         ${rows ? `<ol class="ladder">${rows}</ol>` : '<p class="empty">(no bids)</p>'}
         ${blindNote}
@@ -579,8 +590,16 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
 
     if (agg.lots.size > 0) {
       el.chartWrap.hidden = false;
-      chart ??= new BidChart(root.querySelector<HTMLCanvasElement>('#v-chart')!);
-      el.chartEmpty.hidden = chart.update(agg);
+      if (chart) {
+        el.chartEmpty.hidden = chart.update(agg);
+      } else if (!chartLoading) {
+        // Chart.js is a third of the bundle and nobody needs it to sign in or
+        // read the board, so it arrives after the first paint, on its own.
+        chartLoading = import('./chart').then(({ BidChart }) => {
+          chart = new BidChart(root.querySelector<HTMLCanvasElement>('#v-chart')!);
+          update();
+        });
+      }
     }
 
     phaseKey = keyOf(phase, agg);
@@ -705,9 +724,15 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     }
 
     if (act === 'rename') {
-      const lot = connection.agg?.lots.get(target.dataset.lot!);
-      const name = prompt('New name for this lot:', lot?.name ?? '');
-      if (name) await submit({ type: 'renameLot', lotId: target.dataset.lot!, name });
+      renamingLot = target.dataset.lot!;
+      update();
+      root.querySelector<HTMLInputElement>(`[data-k="rename-${CSS.escape(renamingLot)}"]`)?.select();
+      return;
+    }
+
+    if (act === 'rename-cancel') {
+      renamingLot = null;
+      update();
       return;
     }
 
@@ -753,6 +778,17 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     } else if (kind === 'lot') {
       await submit({ type: 'addLot', name: String(data.get('name')) }, () => {
         panel = null;
+      });
+    } else if (kind === 'rename') {
+      const lotId = form.dataset.lot!;
+      const name = String(data.get('name')).trim();
+      if (!name || name === connection.agg?.lots.get(lotId)?.name) {
+        renamingLot = null;
+        update();
+        return;
+      }
+      await submit({ type: 'renameLot', lotId, name }, () => {
+        renamingLot = null;
       });
     } else if (kind === 'rules') {
       const body = {

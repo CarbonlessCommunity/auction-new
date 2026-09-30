@@ -323,8 +323,10 @@ given everything before it — a bid that did not beat the best its bidder could
 see, a bid outside the clock, an Extended Time push that does not match the
 arithmetic, a withdrawal naming the wrong owner, a gap in the numbering. A
 hand-crafted write lands, but it lands in an append-only log that says exactly
-what it is. (Two genuine bids submitted in the same instant can also be listed:
-each was validated against the board *before* the other landed.)
+what it is. Two genuine bids submitted in the same instant do *not* end up
+here: `submit()` validates once for instant feedback, then again inside the
+append transaction against whatever landed in between, so the second to arrive
+is judged against the first.
 
 `npm run test:rules` asserts each guarantee above, and documents the two gaps
 as explicit tests so a future change that closes one is noticed.
@@ -381,5 +383,5 @@ tests/rules/    security rules, against the emulator
   emulator speaks HTTP/1.1, every tab holds a listen stream and a write stream
   open, and a browser allows six connections per host — a fourth tab simply
   stops receiving events. Production is HTTP/2 and unaffected.
-- The bundle is ~1MB, most of it Chart.js and the Firestore SDK. It is a single
-  eager chunk; splitting the chart out is the obvious win if that matters.
+- The bundle is ~830KB eager (most of it the Firestore SDK) plus a ~210KB
+  Chart.js chunk that loads after the first paint, on the board only.
