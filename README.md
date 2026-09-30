@@ -242,6 +242,39 @@ lands just under a legal step about as often as just over it — `0.0701 - 0.07`
 `0.00009999999999998899`, which would refuse a bid that is exactly one step
 better. See [`src/shared/rules.ts`](src/shared/rules.ts).
 
+### On the day
+
+A few things exist purely because a real auction is five tense minutes with
+twelve people on twelve machines:
+
+- **One clock.** Every browser writes a heartbeat doc stamped with the
+  *server's* time, reads it back, and keeps the offset from its own clock
+  (`Connection.now`). A supplier whose laptop is half a minute out still sees
+  Last Call open when everyone else does, and their bids carry the corrected
+  time. The estimate is re-taken every 30 seconds and kept NTP-style — the
+  reading over the shortest round trip wins — unless a new reading disagrees by
+  more than both error bars, which means the machine's clock actually moved.
+- **Who is here.** The same heartbeats tell the auctioneer who is connected
+  *right now*, not just who has ever signed in: the People button reads
+  "3 of 5 online" and each roster row says online, left N minutes ago, or not
+  signed in yet. The rules let only an auctioneer list them.
+- **Outbid.** When a supplier loses the lead on a term, the term says so, pulses,
+  a toast names it, and the tab title gains "Outbid ·" so it shows from another
+  tab. Nothing in the log says "you were outbid" — it is a comparison between
+  two paintings of the board — so it is spotted at render time. Inside blind
+  Last Call a rival's bid never reaches that screen, so nothing fires there.
+- **The number to beat** sits in the bid box as its placeholder. It is the
+  *visible* best, the same one the bid will be validated against, so in Last
+  Call it can only ever name a price the supplier had already seen.
+- **Fat fingers.** A bid more than half again past the current best (0.0537
+  typed as 0.0057), or a bid of zero, gets one plain question before it lands.
+  Withdrawal exists for the ones that get through, but a wrong bid that sits on
+  the board for a minute moves everyone else.
+- **Audit log.** Once the auction has started the auctioneer has an *Audit
+  log* button that replays the whole log through the same `validateInbound`
+  every screen uses and lists anything it would have refused — see
+  [Trust model](#trust-model) for why that matters.
+
 ## Trust model
 
 With no backend, the browser is the only thing running `validateInbound`, and
@@ -283,6 +316,16 @@ has no browser dependencies. Until then, treat the auction as **auditable rather
 than sealed**, which is fine among identified counterparties and not fine against
 a motivated adversary.
 
+"Auditable" is a button, not a promise: the auctioneer's **Audit log**
+([`src/shared/audit.ts`](src/shared/audit.ts)) replays the stored log from the
+start and asks, of each event, whether `validateInbound` would have accepted it
+given everything before it — a bid that did not beat the best its bidder could
+see, a bid outside the clock, an Extended Time push that does not match the
+arithmetic, a withdrawal naming the wrong owner, a gap in the numbering. A
+hand-crafted write lands, but it lands in an append-only log that says exactly
+what it is. (Two genuine bids submitted in the same instant can also be listed:
+each was validated against the board *before* the other landed.)
+
 `npm run test:rules` asserts each guarantee above, and documents the two gaps
 as explicit tests so a future change that closes one is noticed.
 
@@ -304,11 +347,12 @@ as explicit tests so a future change that closes one is noticed.
 ## Layout
 
 ```
-src/shared/     types, rules, config, schemas, aggregate, validation, admins
+src/shared/     types, rules, config, schemas, aggregate, validation, audit, admins
 src/client/     firebase, auth (email/password + secondary-app account
                 provisioning), connection (transactional append + listeners +
-                seats + participant management), views (sign-in, create, admin
-                panel, auction board, chart), export, format
+                seats + participant management + heartbeats/clock), views
+                (sign-in, create, admin panel, auction board, chart, presence),
+                export, format
 firestore.rules the enforcement boundary — read the header comment
 tests/          domain rules, bid comparison, validation
 tests/rules/    security rules, against the emulator
@@ -327,8 +371,15 @@ tests/rules/    security rules, against the emulator
   after a revoke is harmless — no seat, no access.
 - **Password reset from the panel** works only while the password on file is
   current; if a participant changed their own, remove and re-add them.
-- **Clock skew** is not corrected: countdowns come from each browser's own
-  `Date.now()`, so a badly-set machine will disagree by its own offset. The
-  security rules allow a 5-second grace window on the deadline for this reason.
+- **Clock skew** is corrected from the server's stamp on each heartbeat (see
+  [On the day](#on-the-day)), so every screen counts down together. The
+  security rules still allow a 5-second grace window on the deadline, for a bid
+  in flight as the clock runs out.
+- **Testing several participants in one browser against the emulator**: each
+  tab needs its own origin for its own sign-in (`localhost:5173`, `:5174`, …
+  from separate `vite --port` instances), and keep it to two or three tabs. The
+  emulator speaks HTTP/1.1, every tab holds a listen stream and a write stream
+  open, and a browser allows six connections per host — a fourth tab simply
+  stops receiving events. Production is HTTP/2 and unaffected.
 - The bundle is ~1MB, most of it Chart.js and the Firestore SDK. It is a single
   eager chunk; splitting the chart out is the obvious win if that matters.

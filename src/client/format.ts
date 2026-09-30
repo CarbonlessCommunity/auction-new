@@ -36,13 +36,22 @@ export function formatValue(value: number): string {
   });
 }
 
+/** "just now", "40s ago", "3 min ago", "2 hr ago" — for a last-seen stamp. */
+export function formatAgo(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  if (s < 10) return 'just now';
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  return `${Math.floor(s / 3600)} hr ago`;
+}
+
 export function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!,
   );
 }
 
-export function toast(message: string, kind: 'info' | 'error' = 'info'): void {
+export function toast(message: string, kind: 'info' | 'warn' | 'error' = 'info'): void {
   const host = document.getElementById('toasts');
   if (!host) return;
 
@@ -51,7 +60,7 @@ export function toast(message: string, kind: 'info' | 'error' = 'info'): void {
   node.textContent = message;
   host.append(node);
 
-  setTimeout(() => node.remove(), kind === 'error' ? 6000 : 3500);
+  setTimeout(() => node.remove(), kind === 'info' ? 3500 : 6000);
 }
 
 /**

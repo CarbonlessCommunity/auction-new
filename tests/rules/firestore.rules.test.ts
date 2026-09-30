@@ -6,7 +6,7 @@ import {
   initializeTestEnvironment,
   type RulesTestEnvironment,
 } from '@firebase/rules-unit-testing';
-import { doc, getDoc, getDocs, collection, setDoc, updateDoc, deleteDoc } from 'firebase/firestore';
+import { doc, getDoc, getDocs, collection, setDoc, updateDoc, deleteDoc, serverTimestamp } from 'firebase/firestore';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 /**
@@ -736,6 +736,65 @@ describe('supplier anonymity', () => {
     expect(snap.data()).toMatchObject({ role: 'bidder', label: 'Supplier B' });
     expect(snap.data()!.name).toBeUndefined();
     expect(snap.data()!.email).toBeUndefined();
+  });
+});
+
+describe('presence heartbeats', () => {
+  const beat = (db: ReturnType<typeof as>, uid: string) => doc(db, 'auctions', AUCTION, 'presence', uid);
+
+  it('lets a seated participant heartbeat as their own slot, on server time', async () => {
+    await assertSucceeds(setDoc(beat(as(ALICE), ALICE.uid), { publicKey: ALICE_KEY, at: serverTimestamp() }));
+    await assertSucceeds(setDoc(beat(as(DAVE), DAVE.uid), { publicKey: DAVE_KEY, at: serverTimestamp() }));
+    // A second device is a second doc, same slot.
+    await assertSucceeds(
+      setDoc(beat(as(ALICE_ELSEWHERE), ALICE_ELSEWHERE.uid), { publicKey: ALICE_KEY, at: serverTimestamp() }),
+    );
+  });
+
+  it('lets an admin heartbeat with no seat', async () => {
+    await assertSucceeds(setDoc(beat(as(ADMIN), ADMIN.uid), { publicKey: OWNER_KEY, at: serverTimestamp() }));
+  });
+
+  /** The stamp is what the clock-skew estimate reads, so it must be the server's. */
+  it('refuses a client-chosen timestamp', async () => {
+    await assertFails(setDoc(beat(as(ALICE), ALICE.uid), { publicKey: ALICE_KEY, at: new Date() }));
+    await assertFails(setDoc(beat(as(ALICE), ALICE.uid), { publicKey: ALICE_KEY, at: nowSec() }));
+  });
+
+  it('refuses heartbeating as a rival slot, under another uid, or with extra fields', async () => {
+    await assertFails(setDoc(beat(as(ALICE), ALICE.uid), { publicKey: BOB_KEY, at: serverTimestamp() }));
+    await assertFails(setDoc(beat(as(ALICE), BOB.uid), { publicKey: ALICE_KEY, at: serverTimestamp() }));
+    await assertFails(
+      setDoc(beat(as(ALICE), ALICE.uid), { publicKey: ALICE_KEY, at: serverTimestamp(), name: 'Alice' }),
+    );
+  });
+
+  it('refuses a stranger and an unauthenticated client', async () => {
+    await assertFails(setDoc(beat(as(STRANGER), STRANGER.uid), { publicKey: ALICE_KEY, at: serverTimestamp() }));
+    await assertFails(setDoc(beat(as(null), 'anyone'), { publicKey: ALICE_KEY, at: serverTimestamp() }));
+  });
+
+  /** Who is online is the auctioneer's view; a supplier gets only their own doc. */
+  it('lets only the auctioneer list heartbeats', async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await setDoc(beat(ctx.firestore(), ALICE.uid), { publicKey: ALICE_KEY, at: new Date() });
+      await setDoc(beat(ctx.firestore(), BOB.uid), { publicKey: BOB_KEY, at: new Date() });
+    });
+    await assertSucceeds(getDocs(collection(as(OWNER), 'auctions', AUCTION, 'presence')));
+    await assertSucceeds(getDocs(collection(as(ADMIN), 'auctions', AUCTION, 'presence')));
+    await assertFails(getDocs(collection(as(ALICE), 'auctions', AUCTION, 'presence')));
+    await assertFails(getDocs(collection(as(DAVE), 'auctions', AUCTION, 'presence')));
+    await assertSucceeds(getDoc(beat(as(ALICE), ALICE.uid)));
+    await assertFails(getDoc(beat(as(ALICE), BOB.uid)));
+  });
+
+  it('lets a participant clear their own heartbeat and nobody else\'s', async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await setDoc(beat(ctx.firestore(), ALICE.uid), { publicKey: ALICE_KEY, at: new Date() });
+      await setDoc(beat(ctx.firestore(), BOB.uid), { publicKey: BOB_KEY, at: new Date() });
+    });
+    await assertFails(deleteDoc(beat(as(ALICE), BOB.uid)));
+    await assertSucceeds(deleteDoc(beat(as(ALICE), ALICE.uid)));
   });
 });
 

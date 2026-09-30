@@ -249,6 +249,31 @@ service cloud.firestore {
       match /credentials/{publicKey} {
         allow read, write: if isAdmin();
       }
+
+      // ---- presence/{uid} : heartbeats -----------------------------------
+      //
+      // Each open browser writes its own doc every half minute, stamped with
+      // the server's clock (`at == request.time` is what forces the stamp to
+      // be the server's, not the client's). Read back, the stamp tells that
+      // browser how far its own clock is off; listed by the auctioneer, the
+      // stamps say who is connected right now.
+      //
+      // Carries only the writer's public slot key, which must be the one their
+      // seat grants — a bidder cannot heartbeat as a rival. Nothing here names
+      // anyone, but the set of who-is-online is the auctioneer's to see, not a
+      // rival's, so only an auctioneer may list it.
+      match /presence/{uid} {
+        allow get: if request.auth != null && request.auth.uid == uid;
+        allow list: if isOwner();
+
+        allow create, update: if request.auth != null
+          && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['publicKey', 'at'])
+          && request.resource.data.at == request.time
+          && (isAdmin() || (hasSeat() && request.resource.data.publicKey == seat().publicKey));
+
+        allow delete: if request.auth != null && request.auth.uid == uid;
+      }
     }
   }
 }

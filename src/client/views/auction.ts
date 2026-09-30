@@ -4,11 +4,23 @@ import { renderSignIn } from './signin';
 import type { AuctionAggregate, StoredLot, StoredUser } from '../../shared/aggregate';
 import type { AuctionPhase, BidDirection, Role } from '../../shared/types';
 import { MAX_BIDDERS, MAX_LOTS } from '../../shared/rules';
-import { bidderColor, escapeHtml, formatClock, formatValue, patch, toast } from '../format';
+import { auditLog } from '../../shared/audit';
+import { bidderColor, escapeHtml, formatAgo, formatClock, formatValue, patch, toast } from '../format';
 import { exportBidsCsv, exportResultsCsv } from '../export';
 import { BidChart } from './chart';
+import { presenceStatus } from './presence';
 
-type Panel = 'lot' | 'people' | 'rules' | null;
+type Panel = 'lot' | 'people' | 'rules' | 'audit' | null;
+
+/**
+ * A bid this far past the current best — half again, either direction — is
+ * more likely a slipped decimal point than a price, so it gets a second look
+ * before it lands. Withdrawal exists for the ones that get through, but a
+ * wrong bid that sits on the board for even a minute moves everyone else.
+ */
+const IMPLAUSIBLE_IMPROVEMENT = 0.5;
+/** How long the outbid banner pulses after it appears. */
+const OUTBID_FLASH_MS = 2500;
 
 /** The live auction screen: board, clock, owner tools and chart. */
 export function renderAuction(root: HTMLElement, auctionId: string): void {
@@ -57,6 +69,10 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
   let rulesDismissed = false;
   /** The auctioneer's roster, fetched on demand — see `refreshRoster`. */
   let roster: RosterEntry[] | null = null;
+  /** Per term, who led the last time the board was painted — see `trackOutbid`. */
+  const leaders = new Map<string, string | undefined>();
+  /** Terms this supplier led and has since lost, and when (local ms). */
+  const outbid = new Map<string, number>();
 
   const isOwner = () => connection.you?.role === 'owner';
   const canBid = () => connection.you?.role === 'bidder';
@@ -91,6 +107,37 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
 
     el.phase.textContent = status.text;
     el.topbar.className = `topbar ${status.cls}`;
+
+    // The tab title carries the clock too, for the supplier who has five
+    // terms on this tab and their spreadsheet on another.
+    const clock = phase.isCompleted ? status.text || 'Ended' : formatClock(shown);
+    const state = phase.isCompleted || !status.text ? '' : ` ${status.text}`;
+    const alert = canBid() && outbid.size > 0 ? 'Outbid · ' : '';
+    const title = `${alert}${clock}${state} · ${agg.name}`;
+    if (document.title !== title) document.title = title;
+  }
+
+  /**
+   * Notices a supplier losing the lead on a term. Nothing in the log says
+   * "you were outbid" — it is a comparison between two paintings of the
+   * board — so it is spotted here, once per repaint, and remembered until
+   * they lead that term again. Inside blind Last Call a rival's bid never
+   * reaches this screen, so nothing fires there; that is the point of blind.
+   */
+  function trackOutbid(agg: AuctionAggregate): void {
+    if (!canBid()) return;
+    const me = connection.you!.publicKey;
+
+    for (const lot of agg.lots.values()) {
+      const leader = agg.standings(lot.id)[0]?.bidder;
+      const previous = leaders.get(lot.id);
+      if (previous === me && leader !== undefined && leader !== me) {
+        outbid.set(lot.id, Date.now());
+        toast(`You've been outbid on ${lot.name}.`, 'warn');
+      }
+      if (leader === me) outbid.delete(lot.id);
+      leaders.set(lot.id, leader);
+    }
   }
 
   function renderControls(agg: AuctionAggregate, phase: AuctionPhase): void {
@@ -112,7 +159,12 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       buttons.push(`<button class="primary" data-act="release">Release results to everyone</button>`);
     }
 
-    buttons.push(`<button data-act="panel-people">People (${agg.users.size})</button>`);
+    // "Who is actually here" is the question in the ten minutes before Start,
+    // so it sits on the button rather than behind it.
+    const others = [...agg.users.values()].filter((user) => user.publicKey !== connection.you!.publicKey);
+    const online = others.filter((user) => connection.isOnline(user.publicKey)).length;
+    buttons.push(`<button data-act="panel-people">People · ${online} of ${others.length} online</button>`);
+    if (!notStarted) buttons.push('<button data-act="panel-audit">Audit log</button>');
     buttons.push('<button data-act="export-results">Download results (CSV)</button>');
     buttons.push('<button data-act="export-bids">Download bid log (CSV)</button>');
 
@@ -162,6 +214,22 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       return;
     }
 
+    if (panel === 'audit') {
+      el.panel.innerHTML = `
+        <div class="card panel">
+          <h3>Audit log</h3>
+          ${auditReport(agg)}
+          <p class="hint">
+            Replays the whole log through the same validator every screen uses and lists
+            anything it would have refused. Bid arithmetic is enforced only in the
+            submitting browser, so an entry here means a write that bypassed it — or two
+            bids landing in the same instant, or a badly set clock. Everything listed
+            still stands on the board — withdraw it if it should not.
+          </p>
+        </div>`;
+      return;
+    }
+
     if (panel === 'rules') {
       const c = agg.config;
       el.panel.innerHTML = `
@@ -205,13 +273,11 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
           entry.role === 'bidder'
             ? `<span class="swatch" style="background:${bidderColor(entry.colorIndex)}"></span>`
             : '';
-        const status = entry.role === 'owner'
+        const status = entry.isYou
           ? ''
           : entry.email === null
             ? '<span class="status is-revoked">access removed</span>'
-            : entry.signedInAt !== null
-              ? '<span class="status is-in">signed in</span>'
-              : '<span class="status is-waiting">not signed in yet</span>';
+            : presenceStatus(connection, entry);
 
         return `
           <li class="roster-row">
@@ -227,6 +293,51 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       .join('');
 
     return `<ul class="people">${rows}</ul>`;
+  }
+
+  /** The audit panel's body: a clean bill, or one line per finding. */
+  function auditReport(agg: AuctionAggregate): string {
+    const report = auditLog(agg.id, agg.config, connection.auditTrail());
+    if (report.events === 0) return '<p class="muted">Nothing in the log yet.</p>';
+    if (report.findings.length === 0) {
+      return `<p class="audit-ok">All ${report.events} events pass — every bid beat the best it could see, every
+        Extended Time push was right, and nothing landed outside the clock.</p>`;
+    }
+    const errors = report.findings.filter((finding) => finding.severity === 'error').length;
+    const rows = report.findings
+      .map((finding) => {
+        const event = connection.auditTrail()[finding.seq];
+        const where = describeEvent(agg, event);
+        return `<li class="audit-row is-${finding.severity}">
+          <span class="audit-seq">#${finding.seq}</span>
+          <span class="grow"><strong>${escapeHtml(where)}</strong><br />${escapeHtml(finding.message)}</span>
+        </li>`;
+      })
+      .join('');
+    return `<p>${report.events} events, ${report.findings.length} flagged${
+      errors ? ` (${errors} would have been refused)` : ''
+    }:</p><ul class="audit">${rows}</ul>`;
+  }
+
+  /** One line saying what an event was, in board terms. */
+  function describeEvent(agg: AuctionAggregate, event: { type: string; [key: string]: unknown } | undefined): string {
+    if (!event) return 'unknown event';
+    const lot = typeof event.lotId === 'string' ? agg.lots.get(event.lotId)?.name ?? event.lotId : '';
+    const who = typeof event.bidder === 'string' ? agg.users.get(event.bidder)?.name ?? event.bidder : '';
+    switch (event.type) {
+      case 'placeBid':
+        return `bid of ${formatValue(event.value as number)} on ${lot} by ${who}${event.placedBy ? ' (entered by the auctioneer)' : ''}`;
+      case 'cancelBid':
+        return `withdrawal of bid #${event.bidSeq}${who ? ` (${who}'s)` : ''}`;
+      case 'addUser':
+        return `participant added (${event.label ?? event.publicKey})`;
+      case 'addLot':
+        return `contract term added (${event.name})`;
+      case 'renameLot':
+        return `contract term renamed (${event.name})`;
+      default:
+        return event.type;
+    }
   }
 
   /** Re-reads the roster from Firestore, then repaints whatever is on screen. */
@@ -340,12 +451,17 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     const eligible = phase.isInLastCall ? agg.lastCallEligible(lot.id) : null;
     const lockedOut = eligible !== null && !eligible.includes(yourKey);
 
+    // The number to beat, in the box itself. It is the *visible* best — the
+    // same one a bid is validated against — so inside blind Last Call it
+    // can only ever name a price this supplier had already seen.
+    const target = bidTarget(agg, lot.id);
+
     const yourForm = !bidding
       ? ''
       : lockedOut
         ? `<p class="locked">Last Call — open only to the ${agg.config.lastCallBidders} leading bidders on this term.</p>`
         : `<form class="bidform" data-form="bid" data-lot="${lot.id}">
-             <input name="value" type="number" step="any" min="0" data-k="bid-${lot.id}" placeholder="Your bid" required />
+             <input name="value" type="number" step="any" min="0" data-k="bid-${lot.id}" placeholder="${escapeHtml(target)}" required />
              <button class="primary">Bid</button>
            </form>`;
 
@@ -357,22 +473,64 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
                  .map((b) => `<option value="${b.publicKey}">${escapeHtml(b.name)}</option>`)
                  .join('')}
              </select>
-             <input name="value" type="number" step="any" min="0" data-k="behalf-${lot.id}" placeholder="Amount" required />
+             <input name="value" type="number" step="any" min="0" data-k="behalf-${lot.id}" placeholder="${escapeHtml(target)}" required />
              <button>Bid</button>
            </form>`
         : '';
 
+    const since = outbid.get(lot.id);
+    const outbidNote =
+      since === undefined
+        ? ''
+        : `<p class="outbid ${Date.now() - since < OUTBID_FLASH_MS ? 'flash' : ''}">You've been outbid${
+            bidding && !lockedOut ? ' — bid again to lead' : ''
+          }</p>`;
+
     return `
-      <section class="term" data-lot="${lot.id}">
+      <section class="term ${since === undefined ? '' : 'is-outbid'}" data-lot="${lot.id}">
         <header>
           <h2>${escapeHtml(lot.name)}</h2>
           ${isOwner() && agg.startTime === null ? `<button class="link" data-act="rename" data-lot="${lot.id}">rename</button>` : ''}
         </header>
+        ${outbidNote}
         ${rows ? `<ol class="ladder">${rows}</ol>` : '<p class="empty">(no bids)</p>'}
         ${blindNote}
         ${yourForm}
         ${onBehalf}
       </section>`;
+  }
+
+  /** The best bid this viewer is allowed to see on a term, as `validateInbound` will judge it. */
+  function visibleBest(agg: AuctionAggregate, lotId: string): number | null {
+    const you = connection.you!;
+    return agg.visibleBestFor(lotId, { publicKey: you.publicKey, role: you.role }, connection.now())?.value ?? null;
+  }
+
+  /** Placeholder text for a bid box: the price a bid has to beat, or an invitation if there is none. */
+  function bidTarget(agg: AuctionAggregate, lotId: string): string {
+    const best = visibleBest(agg, lotId);
+    if (best === null) return 'Your bid';
+    const { bidDirection, minBidStep } = agg.config;
+    if (minBidStep > 0) {
+      return bidDirection === 'reverse' ? `≤ ${formatValue(best - minBidStep)}` : `≥ ${formatValue(best + minBidStep)}`;
+    }
+    return bidDirection === 'reverse' ? `< ${formatValue(best)}` : `> ${formatValue(best)}`;
+  }
+
+  /**
+   * The fat-finger check. A bid the validator will accept can still be a
+   * mistake — 0.0537 typed as 0.0057 is a perfectly legal, catastrophically
+   * good price — so anything implausibly far past the best gets one plain
+   * question before it lands. Null when the bid looks like a price.
+   */
+  function implausible(agg: AuctionAggregate, lotId: string, value: number): string | null {
+    if (!(value > 0)) return `A bid of ${formatValue(value)} is not a price.`;
+    const best = visibleBest(agg, lotId);
+    if (best === null || best <= 0) return null;
+    const improvement = agg.config.bidDirection === 'reverse' ? (best - value) / best : (value - best) / best;
+    if (improvement <= IMPLAUSIBLE_IMPROVEMENT) return null;
+    const pct = Math.round(improvement * 100);
+    return `${formatValue(value)} is ${pct}% ${agg.config.bidDirection === 'reverse' ? 'below' : 'above'} the current best of ${formatValue(best)}.`;
   }
 
   function update(): void {
@@ -412,6 +570,7 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       <span class="view">${escapeHtml(viewBanner(connection.you.role))}</span>
       ${signedInAs()}`;
 
+    trackOutbid(agg);
     renderClock(agg, phase);
     renderControls(agg, phase);
     renderPanel(agg);
@@ -465,7 +624,16 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
   }
 
   function keyOf(phase: AuctionPhase, agg: AuctionAggregate): string {
-    return [phase.isRunning, phase.isInExtendedTime, phase.isInLastCall, phase.isCompleted, agg.showResultsReleased].join('|');
+    return [
+      phase.isRunning,
+      phase.isInExtendedTime,
+      phase.isInLastCall,
+      phase.isCompleted,
+      agg.showResultsReleased,
+      // Someone dropping off the board is a clock event too: their last beat
+      // simply ages out, and nothing else would trigger the repaint.
+      connection.onlineKey(),
+    ].join('|');
   }
 
   // --- interaction -------------------------------------------------------
@@ -560,6 +728,11 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
 
     const data = new FormData(form);
     const kind = form.dataset.form;
+
+    if (kind === 'bid' || kind === 'behalf') {
+      const doubt = connection.agg ? implausible(connection.agg, form.dataset.lot!, Number(data.get('value'))) : null;
+      if (doubt && !confirm(`${doubt} Place it anyway?`)) return;
+    }
 
     if (kind === 'bid') {
       const field = `bid-${form.dataset.lot}`;

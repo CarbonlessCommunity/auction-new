@@ -4,6 +4,7 @@ import { isAdminEmail } from '../../shared/admins';
 import type { Role } from '../../shared/types';
 import { bidderColor, escapeHtml, toast } from '../format';
 import { renderCreateForm } from './create';
+import { presenceStatus } from './presence';
 import { renderSignIn, renderVerifyNotice } from './signin';
 
 /**
@@ -257,14 +258,11 @@ function renderManager(root: HTMLElement, auctionId: string, signal: AbortSignal
       entry.role === 'bidder'
         ? `<span class="swatch" style="background:${bidderColor(entry.colorIndex)}"></span>`
         : '';
-    const status =
-      entry.role === 'owner'
-        ? ''
-        : entry.email === null
-          ? '<span class="status is-revoked">access removed</span>'
-          : entry.signedInAt !== null
-            ? '<span class="status is-in">signed in</span>'
-            : '<span class="status is-waiting">not signed in yet</span>';
+    const status = entry.isYou
+      ? ''
+      : entry.email === null
+        ? '<span class="status is-revoked">access removed</span>'
+        : presenceStatus(connection, entry);
 
     let actions = '';
     if (entry.role !== 'owner') {

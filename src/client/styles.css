@@ -253,3 +253,32 @@ label > span { display: block; margin-bottom: 0.25rem; }
   .clock { font-size: 1.4rem; }
   .grid-2 { grid-template-columns: 1fr; }
 }
+
+/* --- outbid --- */
+/* A supplier who has lost the lead on a term gets told so on the term itself:
+   a pulse when it happens, a standing note until they lead again. */
+.term.is-outbid h2 { color: var(--hot); }
+.outbid {
+  margin: 0; padding: 0.3rem 0.4rem;
+  font-size: 0.72rem; font-weight: 600; color: var(--hot);
+  border: 1px solid var(--hot); border-radius: 5px; text-align: center;
+}
+.outbid.flash { animation: outbid-flash 0.5s ease-in-out 4; }
+@keyframes outbid-flash {
+  50% { background: rgba(224, 75, 31, 0.25); }
+}
+
+/* --- presence --- */
+.status.is-online { color: var(--good); border-color: var(--good); }
+
+/* --- audit --- */
+.audit-ok { margin: 0; color: var(--good); font-size: 0.9rem; }
+.audit { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.4rem; font-size: 0.85rem; }
+.audit-row {
+  display: flex; gap: 0.6rem; align-items: flex-start;
+  padding: 0.4rem 0.6rem; border-left: 3px solid var(--warn); background: var(--surface-2); border-radius: 4px;
+}
+.audit-row.is-error { border-left-color: var(--hot); }
+.audit-seq { font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; }
+
+.toast.warn { border-left-color: var(--warn); }

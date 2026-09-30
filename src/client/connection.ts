@@ -3,6 +3,7 @@ import {
   deleteDoc,
   doc,
   getDoc,
+  getDocFromServer,
   getDocs,
   onSnapshot,
   orderBy,
@@ -10,6 +11,7 @@ import {
   runTransaction,
   serverTimestamp,
   setDoc,
+  Timestamp,
   updateDoc,
 } from 'firebase/firestore';
 import type { User } from 'firebase/auth';
@@ -136,6 +138,33 @@ interface CredentialDocData {
   updatedAt: number;
 }
 
+/**
+ * `auctions/{id}/presence/{uid}` — one heartbeat per open browser, stamped with
+ * the *server's* clock. It does two jobs at once. Read back after the write,
+ * the server stamp tells this browser how far its own clock is off, which is
+ * what keeps every screen's countdown — and so the moment Last Call opens —
+ * agreeing (`Connection.now`). Listed by the auctioneer, the stamps say who is
+ * actually connected right now, as opposed to who has ever signed in.
+ *
+ * Carries nothing identifying: only the public slot key. `firestore.rules`
+ * lets a participant write their own doc with their own slot and the server's
+ * time, and lets only the auctioneer enumerate them.
+ */
+interface PresenceDocData {
+  publicKey: string;
+  at: Timestamp;
+}
+
+/** Seconds between heartbeats. */
+export const HEARTBEAT_SEC = 30;
+/**
+ * A participant counts as online for this long after their last heartbeat.
+ * Wider than two beats: a browser throttles a background tab's timers to once
+ * a minute, and a supplier who has the board in a background tab is still
+ * here.
+ */
+export const ONLINE_WINDOW_SEC = 100;
+
 const auctionRef = (id: string) => doc(db, 'auctions', id);
 const eventsCol = (id: string) => collection(db, 'auctions', id, 'events');
 const eventRef = (id: string, seq: number) => doc(db, 'auctions', id, 'events', String(seq).padStart(10, '0'));
@@ -146,6 +175,8 @@ const seatsCol = (id: string) => collection(db, 'auctions', id, 'seats');
 const seatRef = (id: string, email: string) => doc(db, 'auctions', id, 'seats', normalizeEmail(email));
 const credentialsCol = (id: string) => collection(db, 'auctions', id, 'credentials');
 const credentialRef = (id: string, publicKey: string) => doc(db, 'auctions', id, 'credentials', publicKey);
+const presenceCol = (id: string) => collection(db, 'auctions', id, 'presence');
+const presenceRef = (id: string, uid: string) => doc(db, 'auctions', id, 'presence', uid);
 
 /** Force one ID-token refresh per session, so a fresh verification click reaches the rules. */
 let adminTokenRefreshed = false;
@@ -355,6 +386,21 @@ export class Connection {
   private unsubAuction: (() => void) | null = null;
   private unsubEvents: (() => void) | null = null;
   private unsubIdentities: (() => void) | null = null;
+  private unsubPresence: (() => void) | null = null;
+  private heartbeatTimer: number | null = null;
+  /**
+   * Server clock minus this machine's, in seconds, and the round trip the
+   * estimate was taken over. See `heartbeat()`.
+   */
+  private clockOffset = 0;
+  private clockOffsetRtt = Infinity;
+  private clockOffsetAt = 0;
+  /**
+   * publicKey → the server time of that participant's latest heartbeat, for
+   * the auctioneer's "who is actually here" view. Empty on every other screen:
+   * the rules let only an auctioneer list the collection.
+   */
+  private presence = new Map<string, number>();
 
   constructor(auctionId: string) {
     this.auctionId = auctionId;
@@ -369,13 +415,20 @@ export class Connection {
   }
 
   /**
-   * Current time in seconds. There is no server handshake to measure skew
-   * against anymore (see the project notes on the client-trusted model), so
-   * this is just the local clock — auctions here are meant for one shared
-   * event, not scored precisely across drifting machines.
+   * Current time in seconds, on the *server's* clock. Every countdown, every
+   * phase flip and every event's `time` stamp reads this. The local clock is
+   * corrected by the offset measured in `heartbeat()`, so a supplier whose
+   * laptop is half a minute out still sees Last Call open when everyone else
+   * does — and cannot be rejected by a rule whose window is server time.
+   * Until the first heartbeat lands the offset is zero, i.e. the old behaviour.
    */
   now(): number {
-    return Date.now() / 1000;
+    return Date.now() / 1000 + this.clockOffset;
+  }
+
+  /** How far this machine's clock was found to be off, in seconds; null until measured. */
+  get clockSkewSec(): number | null {
+    return this.clockOffsetRtt === Infinity ? null : this.clockOffset;
   }
 
   connect(): void {
@@ -393,6 +446,93 @@ export class Connection {
     this.unsubAuction?.();
     this.unsubEvents?.();
     this.unsubIdentities?.();
+    this.unsubPresence?.();
+    if (this.heartbeatTimer !== null) window.clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+    // Best-effort: a doc left behind simply ages out of the online window.
+    if (this.uid) deleteDoc(presenceRef(this.auctionId, this.uid)).catch(() => {});
+  }
+
+  // --- presence + clock ---------------------------------------------------
+
+  /**
+   * Writes this browser's heartbeat and, from the server's stamp on it, takes
+   * a fresh reading of how far the local clock is off.
+   *
+   * The server stamps the doc at some instant inside the write's round trip,
+   * so the midpoint of that trip is the local time to pair it with, and half
+   * the trip is the error bar. NTP-style, the reading taken over the shortest
+   * round trip so far is the one kept — a slow write is a noisy one — and a
+   * reading older than ten minutes is replaced regardless, in case the machine
+   * corrected its own clock meanwhile.
+   */
+  private async heartbeat(): Promise<void> {
+    if (!this.uid || !this.you) return;
+    const ref = presenceRef(this.auctionId, this.uid);
+    try {
+      const sentAt = Date.now();
+      await setDoc(ref, { publicKey: this.you.publicKey, at: serverTimestamp() });
+      const ackedAt = Date.now();
+      const snap = await getDocFromServer(ref);
+      const at = (snap.data() as PresenceDocData | undefined)?.at;
+      if (!at) return;
+
+      const rtt = ackedAt - sentAt;
+      const offset = at.toMillis() / 1000 - (sentAt + ackedAt) / 2000;
+      const stale = Date.now() - this.clockOffsetAt > 10 * 60 * 1000;
+      // Two readings whose error bars do not overlap cannot both be right,
+      // and the newer one is the clock as it is *now* — the machine just
+      // corrected itself, or someone set it. Take it, whatever its trip.
+      const moved = Math.abs(offset - this.clockOffset) > (rtt + this.clockOffsetRtt) / 2000;
+      if (rtt <= this.clockOffsetRtt || stale || moved) {
+        const before = this.clockOffset;
+        this.clockOffset = offset;
+        this.clockOffsetRtt = rtt;
+        this.clockOffsetAt = Date.now();
+        // A corrected clock can move the phase; let the view repaint.
+        if (Math.abs(this.clockOffset - before) > 0.25) this.emit();
+      }
+    } catch {
+      // Offline, or the rules refused us (seat just revoked): nothing to do.
+    }
+  }
+
+  private startHeartbeat(): void {
+    void this.heartbeat();
+    this.heartbeatTimer = window.setInterval(() => void this.heartbeat(), HEARTBEAT_SEC * 1000);
+    // Leaving the page: try to clear our doc so the auctioneer sees us go.
+    window.addEventListener('pagehide', () => {
+      if (this.uid) deleteDoc(presenceRef(this.auctionId, this.uid)).catch(() => {});
+    });
+  }
+
+  /** Server time of `publicKey`'s latest heartbeat, or null if none was seen. */
+  lastSeen(publicKey: string): number | null {
+    return this.presence.get(publicKey) ?? null;
+  }
+
+  /** True if `publicKey` has a browser open on this auction right now. */
+  isOnline(publicKey: string): boolean {
+    const seen = this.presence.get(publicKey);
+    return seen !== undefined && this.now() - seen <= ONLINE_WINDOW_SEC;
+  }
+
+  /**
+   * Who is online, as one comparable string. Presence changes on the clock as
+   * well as on writes — a beat simply ages out — so the view folds this into
+   * the key it polls to decide whether a repaint is due.
+   */
+  onlineKey(): string {
+    return [...this.presence.keys()].filter((key) => this.isOnline(key)).sort().join(',');
+  }
+
+  /**
+   * The log exactly as stored, for the auctioneer's audit. Empty for anyone
+   * else: a supplier's fold is the outbound-filtered one, and hidden Last Call
+   * bids must not reach them by this route either.
+   */
+  auditTrail(): AuctionEvent[] {
+    return this.you?.role === 'owner' ? [...this.rawEvents] : [];
   }
 
   /** True when this viewer is entitled to see real names, not just labels. */
@@ -468,6 +608,30 @@ export class Connection {
         this.emit();
       },
     );
+
+    this.startHeartbeat();
+
+    // Only the auctioneer may enumerate heartbeats; nobody else needs to.
+    if (this.you.role === 'owner') {
+      this.unsubPresence = onSnapshot(presenceCol(this.auctionId), (snap) => {
+        const latest = new Map<string, number>();
+        for (const beat of snap.docs) {
+          const data = beat.data() as Partial<PresenceDocData>;
+          // `at` is null on the writer's own screen until the server acks it.
+          if (typeof data.publicKey !== 'string' || !data.at) continue;
+          const seconds = data.at.toMillis() / 1000;
+          // One person can hold several browsers open; the newest beat counts.
+          if (seconds > (latest.get(data.publicKey) ?? 0)) latest.set(data.publicKey, seconds);
+        }
+        // Heartbeats arrive every half minute from every participant, and
+        // almost none of them change anything on screen. Repaint only when
+        // someone actually comes or goes, so the board is not rebuilt under
+        // the auctioneer's cursor for nothing.
+        const before = this.onlineKey();
+        this.presence = latest;
+        if (this.onlineKey() !== before) this.emit();
+      });
+    }
 
     // Only the auctioneer and observers may enumerate identities — the rules
     // refuse the query outright for a supplier, so we do not even attempt it.
