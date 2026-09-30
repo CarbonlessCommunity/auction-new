@@ -56,6 +56,7 @@ npm run dev:emulator
 | `npm run emulator` | Firebase Auth (`:9099`) + Firestore (`:8080`) emulators, UI on `:4000` |
 | `npm test` | Vitest: domain rules, blind bidding, validation. No services needed |
 | `npm run test:rules` | Firestore security rules, against a throwaway emulator |
+| `npm run test:e2e` | Playwright: one whole auction in three real browsers, against throwaway emulators (first run: `npx playwright install chromium`) |
 | `npm run build` | Bundles the client to `dist/client/` |
 | `npm run deploy` | Builds, then deploys hosting + Firestore rules |
 
@@ -356,8 +357,10 @@ src/client/     firebase, auth (email/password + secondary-app account
                 (sign-in, create, admin panel, auction board, chart, presence),
                 export, format
 firestore.rules the enforcement boundary — read the header comment
-tests/          domain rules, bid comparison, validation
+tests/          domain rules, bid comparison, validation, audit
 tests/rules/    security rules, against the emulator
+tests/e2e/      Playwright smoke test: admin seats two suppliers, they trade the
+                lead, Last Call goes blind, results release, the audit passes
 ```
 
 ## Notes

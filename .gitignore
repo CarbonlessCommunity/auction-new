@@ -13,3 +13,7 @@ ui-debug.log
 
 # Local preview configs for the Claude desktop app
 .claude/
+
+# Playwright
+test-results/
+playwright-report/
