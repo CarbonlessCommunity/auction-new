@@ -352,10 +352,12 @@ as explicit tests so a future change that closes one is noticed.
 ```
 src/shared/     types, rules, config, schemas, aggregate, validation, audit, admins
 src/client/     firebase, auth (email/password + secondary-app account
-                provisioning), connection (transactional append + listeners +
-                seats + participant management + heartbeats/clock), views
-                (sign-in, create, admin panel, auction board, chart, presence),
-                export, format
+                provisioning), store (document shapes + refs), connection (the
+                live board: transactional append, listeners, seat resolution,
+                heartbeats/clock), management (the admin panel: create and list
+                auctions, seat / re-credential / unseat participants, roster),
+                views (sign-in, create, admin panel, auction board, chart,
+                presence), export, format
 firestore.rules the enforcement boundary — read the header comment
 tests/          domain rules, bid comparison, validation, audit
 tests/rules/    security rules, against the emulator

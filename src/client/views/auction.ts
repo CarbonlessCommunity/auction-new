@@ -1,4 +1,5 @@
-import { Connection, type RosterEntry } from '../connection';
+import { Connection } from '../connection';
+import { roster as loadRoster, type RosterEntry } from '../management';
 import { signOutNow } from '../auth';
 import { renderSignIn } from './signin';
 import type { AuctionAggregate, StoredLot, StoredUser } from '../../shared/aggregate';
@@ -346,7 +347,7 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
   /** Re-reads the roster from Firestore, then repaints whatever is on screen. */
   async function refreshRoster(): Promise<void> {
     if (!isOwner()) return;
-    roster = await connection.roster();
+    roster = await loadRoster(connection);
     update();
   }
 

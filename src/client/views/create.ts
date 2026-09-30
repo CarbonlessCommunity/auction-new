@@ -1,4 +1,4 @@
-import { createAuction, type CreateAuctionInput } from '../connection';
+import { createAuction, type CreateAuctionInput } from '../management';
 import { DEFAULT_CONFIG, MAX_BIDDERS, MAX_LOTS } from '../../shared/rules';
 import type { BidDirection } from '../../shared/types';
 import { toast } from '../format';

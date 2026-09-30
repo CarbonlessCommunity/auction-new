@@ -1,4 +1,14 @@
-import { auctionUrl, Connection, listAuctions, type RosterEntry } from '../connection';
+import { Connection } from '../connection';
+import {
+  auctionUrl,
+  changeParticipantEmail,
+  createParticipant,
+  listAuctions,
+  resetParticipantPassword,
+  revokeParticipant,
+  roster as loadRoster,
+  type RosterEntry,
+} from '../management';
 import { currentUser, reloadUser, signOutNow } from '../auth';
 import { isAdminEmail } from '../../shared/admins';
 import type { Role } from '../../shared/types';
@@ -168,7 +178,7 @@ function renderManager(root: HTMLElement, auctionId: string, signal: AbortSignal
 
   const refresh = async (): Promise<void> => {
     if (signal.aborted) return;
-    roster = await connection.roster();
+    roster = await loadRoster(connection);
     if (!signal.aborted) draw();
   };
 
@@ -330,7 +340,7 @@ function renderManager(root: HTMLElement, auctionId: string, signal: AbortSignal
     const data = new FormData(form);
 
     button.disabled = true;
-    const result = await connection.createParticipant({
+    const result = await createParticipant(connection, {
       name: String(data.get('name')),
       email: String(data.get('email')),
       role: data.get('role') as Role,
@@ -375,7 +385,8 @@ function renderManager(root: HTMLElement, auctionId: string, signal: AbortSignal
 
     if (act === 'reset') {
       if (!confirm('Issue a new password? Their current one stops working immediately.')) return;
-      const result = await connection.resetParticipantPassword(
+      const result = await resetParticipantPassword(
+        connection,
         target.dataset.key!,
         target.dataset.email!,
       );
@@ -391,7 +402,8 @@ function renderManager(root: HTMLElement, auctionId: string, signal: AbortSignal
     if (act === 'change-email') {
       const next = prompt('New email address for this participant:', target.dataset.email ?? '');
       if (!next) return;
-      const result = await connection.changeParticipantEmail(
+      const result = await changeParticipantEmail(
+        connection,
         target.dataset.key!,
         target.dataset.email ?? '',
         next,
@@ -415,7 +427,7 @@ function renderManager(root: HTMLElement, auctionId: string, signal: AbortSignal
       if (!confirm(`Remove ${nm}? They're signed out immediately; any bids they placed stay on the board.`)) {
         return;
       }
-      const result = await connection.revokeParticipant(target.dataset.email!, target.dataset.key!);
+      const result = await revokeParticipant(connection, target.dataset.email!, target.dataset.key!);
       if (!result.ok) {
         toast(result.error ?? 'Could not remove access.', 'error');
         return;

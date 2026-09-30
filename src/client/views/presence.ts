@@ -1,4 +1,5 @@
-import type { Connection, RosterEntry } from '../connection';
+import type { Connection } from '../connection';
+import type { RosterEntry } from '../management';
 import { formatAgo } from '../format';
 
 /**
