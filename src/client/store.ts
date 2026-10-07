@@ -36,6 +36,10 @@ export interface AuctionDocData {
   startedAt: number | null;
   auctionLength: number;
   showResults: boolean;
+  /** Server time the auctioneer paused the clock, or null/absent while it runs. */
+  pausedAt?: number | null;
+  /** Hidden from the admin panel's default list; a precondition for deleting. */
+  archived?: boolean;
 }
 
 /**
@@ -125,6 +129,7 @@ export const ONLINE_WINDOW_SEC = 100;
 export const auctionRef = (id: string) => doc(db, 'auctions', id);
 export const eventsCol = (id: string) => collection(db, 'auctions', id, 'events');
 export const eventRef = (id: string, seq: number) => doc(db, 'auctions', id, 'events', String(seq).padStart(10, '0'));
+export const usersCol = (id: string) => collection(db, 'auctions', id, 'users');
 export const userRef = (id: string, publicKey: string) => doc(db, 'auctions', id, 'users', publicKey);
 export const identitiesCol = (id: string) => collection(db, 'auctions', id, 'identities');
 export const identityRef = (id: string, publicKey: string) => doc(db, 'auctions', id, 'identities', publicKey);
@@ -162,6 +167,12 @@ export function mirrorUpdate(event: AuctionEvent): Record<string, unknown> {
       return { name: event.name };
     case 'startAuction':
       return { startedAt: event.time, auctionLength: event.auctionLength };
+    case 'pauseAuction':
+      // The rules refuse bids while this is set, so a pause holds even
+      // against a hand-crafted write.
+      return { pausedAt: event.time };
+    case 'resumeAuction':
+      return { pausedAt: null, auctionLength: event.auctionLength };
     case 'showResults':
       return { showResults: true };
     case 'placeBid':

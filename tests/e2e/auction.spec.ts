@@ -69,7 +69,7 @@ async function bid(page: Page, lot: string, value: string): Promise<void> {
   await box.press('Enter');
 }
 
-test('a whole auction: seat, bid, outbid, Last Call, release, audit', async ({ browser, page: admin }) => {
+test('a whole auction: seat, bid, outbid, pause, Last Call, release, audit, archive, delete', async ({ browser, page: admin }) => {
   await seedAdmin();
 
   // --- the admin panel: create the auction and seat two suppliers ---------
@@ -143,6 +143,20 @@ test('a whole auction: seat, bid, outbid, Last Call, release, audit', async ({ b
   await bid(bob, 'lot-0', '0.01');
   await expect(ladder(bob, 'lot-0').first()).toContainText('0.06900');
 
+  // --- a pause ------------------------------------------------------------
+  // The auctioneer stops the clock; every screen says so, the bid boxes go,
+  // and the clock reads the same when it restarts.
+  await admin.locator('[data-act="pause"]').click();
+  await expect(alice.locator('#v-phase')).toHaveText('Paused');
+  await expect(alice.locator('form[data-form="bid"]')).toHaveCount(0);
+  await expect(alice.locator('[data-lot="lot-0"] .locked')).toContainText('paused the clock');
+  const frozen = await alice.locator('#v-clock').textContent();
+  await alice.waitForTimeout(1500);
+  await expect(alice.locator('#v-clock')).toHaveText(frozen!);
+  await admin.locator('[data-act="resume"]').click();
+  await expect(alice.locator('#v-phase')).not.toHaveText('Paused');
+  await expect(alice.locator('form[data-form="bid"][data-lot="lot-0"] input')).toBeVisible();
+
   // --- Last Call ----------------------------------------------------------
   await expect(admin.locator('#v-phase')).toHaveText('Last Call', { timeout: 30_000 });
   await expect(alice.locator('[data-lot="lot-0"] .locked')).toContainText('Last Call is blind');
@@ -168,4 +182,25 @@ test('a whole auction: seat, bid, outbid, Last Call, release, audit', async ({ b
   // --- the audit ------------------------------------------------------------
   await admin.locator('[data-act="panel-audit"]').click();
   await expect(admin.locator('#v-panel')).toContainText(/All \d+ events pass/);
+
+  // --- putting it away ------------------------------------------------------
+  // Archiving takes it off the list without touching the board; deleting
+  // needs the archive first and the name typed back, and then the board link
+  // stops working for everyone.
+  await admin.goto('/');
+  const list = admin.locator('#auction-list');
+  await expect(list).toContainText('Smoke Test');
+  await expect(list).toContainText('results released');
+  admin.once('dialog', (dialog) => void dialog.accept());
+  await list.locator('[data-act="archive"]').click();
+  await expect(list).not.toContainText('Smoke Test');
+  await expect(alice.locator('#v-name')).toHaveText('Smoke Test');
+
+  await list.locator('[data-act="toggle-archived"]').click();
+  await expect(list).toContainText('Smoke Test');
+  admin.once('dialog', (dialog) => void dialog.accept('Smoke Test'));
+  await list.locator('[data-act="delete"]').click();
+  await expect(list).toContainText('Nothing archived');
+  await alice.reload();
+  await expect(alice.locator('#v-board')).toContainText('No such auction', { timeout: 20_000 });
 });

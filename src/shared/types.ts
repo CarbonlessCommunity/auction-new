@@ -47,6 +47,8 @@ export type EventType =
   | 'placeBid'
   | 'cancelBid'
   | 'startAuction'
+  | 'pauseAuction'
+  | 'resumeAuction'
   | 'showResults';
 
 /** A stored/broadcast event. Canonical (server-enriched) shape; individual
@@ -105,6 +107,22 @@ export interface StartAuctionInput {
   type: 'startAuction';
 }
 
+/**
+ * Stops the clock mid-auction — a dropped call, a dispute, a supplier locked
+ * out — and holds the board exactly where it is: no bids land, no phase flips.
+ */
+export interface PauseAuctionInput {
+  type: 'pauseAuction';
+}
+
+/**
+ * Restarts the clock from where it stopped. The pause's length is added to the
+ * run, so the clock resumes at the time it showed when it was paused.
+ */
+export interface ResumeAuctionInput {
+  type: 'resumeAuction';
+}
+
 export interface ShowResultsInput {
   type: 'showResults';
 }
@@ -117,6 +135,8 @@ export type InboundEventInput =
   | PlaceBidInput
   | CancelBidInput
   | StartAuctionInput
+  | PauseAuctionInput
+  | ResumeAuctionInput
   | ShowResultsInput;
 
 export interface UserView {
@@ -146,7 +166,10 @@ export interface LotView {
 }
 
 export interface AuctionPhase {
+  /** Started, not over, and the clock is moving. False while paused. */
   isRunning: boolean;
+  /** The auctioneer has stopped the clock; the board is frozen where it was. */
+  isPaused: boolean;
   isInExtendedTime: boolean;
   isInLastCall: boolean;
   isCompleted: boolean;

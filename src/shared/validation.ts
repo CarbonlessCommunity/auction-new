@@ -91,6 +91,23 @@ export function validateInbound(
       return { ok: true, event };
     }
 
+    case 'pauseAuction': {
+      const phase = agg.phase(now);
+      if (agg.startTime === null) return fail('The auction has not started yet.');
+      if (phase.isPaused) return fail('The auction is already paused.');
+      if (!phase.isRunning) return fail('The clock has already run out.');
+      return { ok: true, event };
+    }
+
+    case 'resumeAuction': {
+      if (agg.pausedAt === null) return fail('The auction is not paused.');
+      // Stretch the run by however long the clock stood still, so it picks
+      // up from the reading it was stopped at. Recorded on the event, like an
+      // Extended Time push, so the fold never has to recompute it.
+      event.auctionLength = agg.auctionLength + Math.max(0, now - agg.pausedAt);
+      return { ok: true, event };
+    }
+
     case 'showResults': {
       if (agg.startTime === null) return fail('The auction has not started yet.');
       if (agg.showResultsReleased) return fail('Results have already been released.');

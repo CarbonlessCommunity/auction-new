@@ -21,11 +21,16 @@ rules_version = '2';
 //   - Bid arithmetic (beats-current-best, extended-time math, min-step):
 //     enforced client-side only (`validateInbound`), not re-derived here.
 // What this DOES enforce: only an auctioneer can issue admin events, only a
-// seated bidder can bid as itself, a supplier can withdraw only their own bid,
-// an observer can write nothing at all, events are append-only, only an admin
-// can create an auction or read a participant's stored password, and — see
-// `identities` below — a supplier cannot read any other supplier's name or
-// email by any route.
+// seated bidder can bid as itself and only while the clock is running (not
+// paused), a supplier can withdraw only their own bid, an observer can write
+// nothing at all, events are append-only, only an admin can create an auction
+// or read a participant's stored password, and — see `identities` below — a
+// supplier cannot read any other supplier's name or email by any route.
+//
+// The one exception to append-only: an admin may delete an auction that has
+// first been *archived* (a flag on the auction doc), document by document,
+// because Firestore has no recursive delete. A live auction's log cannot be
+// touched by anyone.
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -80,6 +85,18 @@ service cloud.firestore {
         return hasSeat() && seat().role == 'bidder';
       }
 
+      // Archiving is the admin panel's "put it away" — and the precondition
+      // for deleting, so a running auction's log can never be deleted by
+      // mistake, only one that was first taken off the list.
+      function isArchived() {
+        return auction().get('archived', false) == true;
+      }
+
+      // An archived auction may be dismantled by an admin, one doc at a time.
+      function canDismantle() {
+        return isAdmin() && isArchived();
+      }
+
       allow get: if request.auth != null;
       // Only an admin enumerates auctions (the admin panel's auction list).
       // A participant only ever opens one by id, from a link.
@@ -121,12 +138,14 @@ service cloud.firestore {
              + resource.data.config.extendedTimeThresholdSec
       );
 
-      allow delete: if false;
+      // The auction doc goes last, after its subcollections — see canDismantle.
+      allow delete: if isAdmin() && resource.data.get('archived', false) == true;
 
       // ---- events/{eventId} : append-only log -----------------------------
       match /events/{eventId} {
         allow get, list: if request.auth != null;
-        allow update, delete: if false;
+        allow update: if false;
+        allow delete: if canDismantle();
 
         allow create: if request.auth != null
           && request.resource.data.seq == auction().nextSeq
@@ -135,7 +154,8 @@ service cloud.firestore {
         function isAllowedEvent() {
           let type = request.resource.data.type;
           let ownerOnly = type in
-            ['setName', 'addUser', 'addLot', 'renameLot', 'startAuction', 'showResults'];
+            ['setName', 'addUser', 'addLot', 'renameLot', 'startAuction',
+             'pauseAuction', 'resumeAuction', 'showResults'];
           return (ownerOnly && isOwner())
             || (type == 'placeBid' && isAllowedBid())
             || (type == 'cancelBid' && isAllowedCancel());
@@ -157,7 +177,11 @@ service cloud.firestore {
           let withinWindow = auction().startedAt != null
             // small grace window for clock drift / in-flight requests, not a
             // meaningful security boundary given everything else here.
-            && request.time.toMillis() / 1000 <= auction().startedAt + auction().auctionLength + 5;
+            && request.time.toMillis() / 1000 <= auction().startedAt + auction().auctionLength + 5
+            // A paused clock takes no bids. `pausedAt` is mirrored off the
+            // pause/resume events, so this holds against a hand-crafted write
+            // too — the one piece of clock arithmetic the rules can do.
+            && auction().get('pausedAt', null) == null;
           let onBehalf = 'placedBy' in data;
           let asSelf = isBidder() && seat().publicKey == data.bidder;
           return withinWindow && (onBehalf ? isOwner() : asSelf);
@@ -172,15 +196,17 @@ service cloud.firestore {
       // public label ("Supplier C") and the palette slot. Names and email
       // addresses live in `identities` and `seats`, both closed to a rival.
       match /users/{publicKey} {
-        // No `list`: the roster is derived client-side by folding `addUser`
-        // events, so nothing legitimate ever queries this collection.
+        // The roster is derived client-side by folding `addUser` events, so
+        // nothing legitimate queries this collection — except an admin
+        // dismantling an archived auction, who has to find every doc.
         allow get: if request.auth != null;
-        allow list: if false;
+        allow list: if isAdmin();
 
         allow create: if isOwner();
         // Immutable once written. Who *occupies* a slot is now a property of
         // the seat, not of this doc, so there is nothing here left to change.
-        allow update, delete: if false;
+        allow update: if false;
+        allow delete: if canDismantle();
       }
 
       // ---- identities/{publicKey} : real names, access-controlled ---------
@@ -203,7 +229,8 @@ service cloud.firestore {
         allow create: if isOwner();
         // Immutable: a rename would otherwise let the auctioneer's screen and a
         // supplier's own screen disagree about who bid what after the fact.
-        allow update, delete: if false;
+        allow update: if false;
+        allow delete: if canDismantle();
       }
 
       // ---- seats/{email} : who may occupy which slot ----------------------
@@ -249,6 +276,8 @@ service cloud.firestore {
       match /credentials/{publicKey} {
         allow read, write: if isAdmin();
       }
+      // (seats and credentials are admin-deletable already — revoking is a
+      // seat delete — so dismantling needs nothing more from them.)
 
       // ---- presence/{uid} : heartbeats -----------------------------------
       //
@@ -272,7 +301,7 @@ service cloud.firestore {
           && request.resource.data.at == request.time
           && (isAdmin() || (hasSeat() && request.resource.data.publicKey == seat().publicKey));
 
-        allow delete: if request.auth != null && request.auth.uid == uid;
+        allow delete: if (request.auth != null && request.auth.uid == uid) || canDismantle();
       }
     }
   }

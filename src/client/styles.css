@@ -124,6 +124,8 @@ label > span { display: block; margin-bottom: 0.25rem; }
 .topbar.is-extended { background: #c2701e; }
 .topbar.is-lastcall { background: #e2620f; }
 .topbar.is-released { background: #17794a; }
+.topbar.is-paused { background: #5b6472; }
+.topbar.is-paused .clock { opacity: 0.55; }
 
 /* Who you are, and — the part people kept guessing at — which of the three
    screens you are looking at. */

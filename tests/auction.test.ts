@@ -173,3 +173,86 @@ describe('config', () => {
     expect(config.lastCallSec).toBe(120);
   });
 });
+
+describe('pausing the clock', () => {
+  it('freezes the countdown and refuses bids until resumed', () => {
+    const { agg, submit, owner, alice, lot } = startedAuction();
+    submit({ type: 'placeBid', lotId: lot, value: 100 }, alice, T0 + 10);
+
+    const paused = submit({ type: 'pauseAuction' }, owner, T0 + 60);
+    expect(paused.ok).toBe(true);
+
+    // 240s remain on the clock whenever it is read, however long the pause runs.
+    expect(agg.phase(T0 + 61).isPaused).toBe(true);
+    expect(agg.phase(T0 + 61).isRunning).toBe(false);
+    expect(agg.phase(T0 + 61).remainingSec).toBe(300);
+    expect(agg.phase(T0 + 5000).remainingSec).toBe(300);
+    expect(agg.phase(T0 + 5000).isCompleted).toBe(false);
+
+    const blocked = submit({ type: 'placeBid', lotId: lot, value: 90 }, alice, T0 + 70);
+    expect(blocked.ok).toBe(false);
+
+    // Resumed after a two-minute pause: the run is 120s longer, the clock reads the same.
+    const resumed = submit({ type: 'resumeAuction' }, owner, T0 + 180);
+    expect(resumed.ok && resumed.event.auctionLength).toBe(360 + 120);
+    expect(agg.phase(T0 + 180).isRunning).toBe(true);
+    expect(agg.phase(T0 + 180).remainingSec).toBe(300);
+    expect(agg.phase(T0 + 181).isPaused).toBe(false);
+
+    expect(submit({ type: 'placeBid', lotId: lot, value: 90 }, alice, T0 + 190).ok).toBe(true);
+    // The whole run now ends 120s later than it would have.
+    expect(agg.phase(T0 + 479).isRunning).toBe(true);
+    expect(agg.phase(T0 + 480).isCompleted).toBe(true);
+  });
+
+  it('holds Last Call open, and blind, while paused inside it', () => {
+    const { agg, submit, owner, alice, bob, lot } = startedAuction();
+    submit({ type: 'placeBid', lotId: lot, value: 100 }, alice, T0 + 10);
+    submit({ type: 'placeBid', lotId: lot, value: 90 }, bob, T0 + 20);
+
+    const inLastCall = T0 + 320;
+    const blind = submit({ type: 'placeBid', lotId: lot, value: 80 }, alice, inLastCall);
+    expect(blind.ok).toBe(true);
+    expect(submit({ type: 'pauseAuction' }, owner, inLastCall + 5).ok).toBe(true);
+
+    const phase = agg.phase(inLastCall + 30);
+    expect(phase.isPaused).toBe(true);
+    expect(phase.isInLastCall).toBe(true);
+    expect(phase.remainingSec).toBe(35);
+    // Bob still cannot see Alice's blind bid, and the window does not close.
+    expect(agg.isBlindWindow(inLastCall + 30)).toBe(true);
+    expect(agg.visibleBestFor(lot, bob, inLastCall + 30)?.value).toBe(90);
+
+    submit({ type: 'resumeAuction' }, owner, inLastCall + 65);
+    expect(agg.phase(inLastCall + 65).remainingSec).toBe(35);
+    expect(agg.phase(inLastCall + 65).isInLastCall).toBe(true);
+  });
+
+  it('refuses a pause before the start, after the end, or on top of another', () => {
+    const ctx = makeAuction();
+    const owner = ctx.addUser('Organiser', 'owner');
+    ctx.addLot('12 Months');
+    expect(ctx.submit({ type: 'pauseAuction' }, owner, T0).ok).toBe(false);
+    expect(ctx.submit({ type: 'resumeAuction' }, owner, T0).ok).toBe(false);
+
+    ctx.submit({ type: 'startAuction' }, owner, T0);
+    expect(ctx.submit({ type: 'pauseAuction' }, owner, T0 + 10).ok).toBe(true);
+    expect(ctx.submit({ type: 'pauseAuction' }, owner, T0 + 11).ok).toBe(false);
+    expect(ctx.submit({ type: 'resumeAuction' }, owner, T0 + 12).ok).toBe(true);
+    expect(ctx.submit({ type: 'resumeAuction' }, owner, T0 + 13).ok).toBe(false);
+
+    expect(ctx.submit({ type: 'pauseAuction' }, owner, T0 + 1000).ok).toBe(false);
+  });
+
+  it('replays to the same clock', () => {
+    const ctx = startedAuction();
+    ctx.submit({ type: 'pauseAuction' }, ctx.owner, T0 + 100);
+    ctx.submit({ type: 'resumeAuction' }, ctx.owner, T0 + 150);
+    ctx.submit({ type: 'placeBid', lotId: ctx.lot, value: 100 }, ctx.alice, T0 + 160);
+
+    const replayed = AuctionAggregate.replay('test', ctx.config, ctx.log);
+    expect(replayed.auctionLength).toBe(ctx.agg.auctionLength);
+    expect(replayed.pausedAt).toBeNull();
+    expect(replayed.phase(T0 + 200)).toEqual(ctx.agg.phase(T0 + 200));
+  });
+});

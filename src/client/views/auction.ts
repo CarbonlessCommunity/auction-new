@@ -99,15 +99,19 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
 
     const status = agg.showResultsReleased
       ? { text: 'Results Released', cls: 'is-released' }
-      : phase.isInLastCall
-        ? { text: 'Last Call', cls: 'is-lastcall' }
-        : phase.isInExtendedTime
-          ? { text: 'Extended Time', cls: 'is-extended' }
-          : phase.isRunning
-            ? { text: '', cls: '' }
-            : phase.isCompleted
-              ? { text: 'Awaiting Results', cls: '' }
-              : { text: 'Not Started', cls: '' };
+      : phase.isPaused
+        // A stopped clock outranks where it stopped: the one thing every
+        // screen needs to know is that nothing is counting down.
+        ? { text: phase.isInLastCall ? 'Paused — Last Call' : 'Paused', cls: 'is-paused' }
+        : phase.isInLastCall
+          ? { text: 'Last Call', cls: 'is-lastcall' }
+          : phase.isInExtendedTime
+            ? { text: 'Extended Time', cls: 'is-extended' }
+            : phase.isRunning
+              ? { text: '', cls: '' }
+              : phase.isCompleted
+                ? { text: 'Awaiting Results', cls: '' }
+                : { text: 'Not Started', cls: '' };
 
     el.phase.textContent = status.text;
     el.topbar.className = `topbar ${status.cls}`;
@@ -162,6 +166,10 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     if (!notStarted && !agg.showResultsReleased) {
       buttons.push(`<button class="primary" data-act="release">Release results to everyone</button>`);
     }
+    // The clock can be stopped while it runs — a dropped call, a supplier
+    // locked out — and restarted from the same reading.
+    if (phase.isPaused) buttons.push('<button class="primary" data-act="resume">Resume the clock</button>');
+    else if (phase.isRunning) buttons.push('<button data-act="pause">Pause the clock</button>');
 
     // "Who is actually here" is the question in the ten minutes before Start,
     // so it sits on the button rather than behind it.
@@ -176,7 +184,9 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     // show, the other only puts a file on this machine.
     const hint = agg.showResultsReleased
       ? 'Results are released — every screen now shows the Last Call bids. The downloads are private files for you, and always include the firm names.'
-      : notStarted
+      : phase.isPaused
+        ? 'The clock is stopped on every screen and no bids can land. Resuming picks it up from exactly where it stopped.'
+        : notStarted
         ? 'Releasing results is what reveals the Last Call bids on the suppliers’ and client’s screens. Downloading only saves a CSV to this machine.'
         : 'Nobody sees the Last Call bids until you release results. Downloading a CSV changes nothing on their screens — it just saves a file here.';
 
@@ -339,6 +349,10 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
         return `contract term added (${event.name})`;
       case 'renameLot':
         return `contract term renamed (${event.name})`;
+      case 'pauseAuction':
+        return 'clock paused';
+      case 'resumeAuction':
+        return 'clock resumed';
       default:
         return event.type;
     }
@@ -450,6 +464,8 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
       : canBid()
         ? '<p class="locked">Last Call is blind — you can see your own bids only.</p>'
         : '<p class="locked">Last Call is blind — bids placed now appear when results are released.</p>';
+    const pausedNote =
+      phase.isPaused && canBid() ? '<p class="locked">The auctioneer has paused the clock — bidding resumes when it restarts.</p>' : '';
 
     // Last Call hands the term to its leaders; everyone else can only watch.
     const eligible = phase.isInLastCall ? agg.lastCallEligible(lot.id) : null;
@@ -507,6 +523,7 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
         ${outbidNote}
         ${rows ? `<ol class="ladder">${rows}</ol>` : '<p class="empty">(no bids)</p>'}
         ${blindNote}
+        ${pausedNote}
         ${yourForm}
         ${onBehalf}
       </section>`;
@@ -646,6 +663,7 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
   function keyOf(phase: AuctionPhase, agg: AuctionAggregate): string {
     return [
       phase.isRunning,
+      phase.isPaused,
       phase.isInExtendedTime,
       phase.isInLastCall,
       phase.isCompleted,
@@ -714,6 +732,16 @@ export function renderAuction(root: HTMLElement, auctionId: string): void {
     if (act === 'release') {
       if (!confirm('Release results to everyone? Last Call bids become visible on every screen.')) return;
       await submit({ type: 'showResults' });
+      return;
+    }
+
+    if (act === 'pause') {
+      await submit({ type: 'pauseAuction' });
+      return;
+    }
+
+    if (act === 'resume') {
+      await submit({ type: 'resumeAuction' });
       return;
     }
 

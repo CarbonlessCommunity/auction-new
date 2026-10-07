@@ -192,7 +192,9 @@ const adminEvent = (over: Record<string, unknown> = {}) => ({
 describe('admin events are owner-only', () => {
   // `cancelBid` is deliberately not here: a supplier may withdraw a bid of
   // their own, which the block below covers on its own terms.
-  const ownerOnly = ['setName', 'addUser', 'addLot', 'renameLot', 'startAuction', 'showResults'];
+  const ownerOnly = [
+    'setName', 'addUser', 'addLot', 'renameLot', 'startAuction', 'pauseAuction', 'resumeAuction', 'showResults',
+  ];
 
   for (const type of ownerOnly) {
     it(`lets the owner write ${type}`, async () => {
@@ -226,7 +228,7 @@ describe('admins', () => {
   const credentialDoc = (db: ReturnType<typeof as>, key: string) =>
     doc(db, 'auctions', AUCTION, 'credentials', key);
 
-  for (const type of ['setName', 'addUser', 'addLot', 'renameLot', 'startAuction', 'showResults']) {
+  for (const type of ['setName', 'addUser', 'addLot', 'renameLot', 'startAuction', 'pauseAuction', 'resumeAuction', 'showResults']) {
     it(`lets an admin write ${type} with no seat of their own`, async () => {
       await assertSucceeds(setDoc(eventRef(as(ADMIN), 10), adminEvent({ type })));
     });
@@ -395,6 +397,22 @@ describe('the bidding window', () => {
     const db = as(ALICE);
     await assertFails(setDoc(eventRef(db, 10), bid()));
   });
+
+  /**
+   * `pausedAt` is mirrored off the pause/resume events, so a paused clock is
+   * the one piece of clock arithmetic the rules can hold a hostile bidder to.
+   */
+  it('refuses a bid while the clock is paused, and takes one again once resumed', async () => {
+    const pause = (pausedAt: number | null) =>
+      env.withSecurityRulesDisabled(async (ctx) => {
+        await updateDoc(doc(ctx.firestore(), 'auctions', AUCTION), { pausedAt });
+      });
+    await pause(nowSec() - 5);
+    await assertFails(setDoc(eventRef(as(ALICE), 10), bid()));
+    await assertFails(setDoc(eventRef(as(OWNER), 10), bid({ bidder: BOB_KEY, placedBy: OWNER_KEY })));
+    await pause(null);
+    await assertSucceeds(setDoc(eventRef(as(ALICE), 10), bid()));
+  });
 });
 
 describe('the event log is append-only and gapless', () => {
@@ -409,9 +427,9 @@ describe('the event log is append-only and gapless', () => {
     await assertFails(updateDoc(eventRef(db, 9), { type: 'setName', name: 'rewritten' }));
   });
 
-  it('refuses deleting an event', async () => {
-    const db = as(OWNER);
-    await assertFails(deleteDoc(eventRef(db, 9)));
+  it('refuses deleting an event, even by an admin, while the auction is live', async () => {
+    await assertFails(deleteDoc(eventRef(as(OWNER), 9)));
+    await assertFails(deleteDoc(eventRef(as(ADMIN), 9)));
   });
 
   it('lets any signed-in member read the log', async () => {
@@ -666,9 +684,11 @@ describe('the public roster slots', () => {
 });
 
 describe('collections that must never be enumerable', () => {
-  it('refuses listing the participant roster', async () => {
-    const db = as(ALICE);
-    await assertFails(getDocs(collection(db, 'auctions', AUCTION, 'users')));
+  it('refuses listing the participant roster to anyone but an admin', async () => {
+    await assertFails(getDocs(collection(as(ALICE), 'auctions', AUCTION, 'users')));
+    await assertFails(getDocs(collection(as(OWNER), 'auctions', AUCTION, 'users')));
+    // An admin dismantling an archived auction has to find every doc.
+    await assertSucceeds(getDocs(collection(as(ADMIN), 'auctions', AUCTION, 'users')));
   });
 
   it('refuses a participant enumerating auctions', async () => {
@@ -795,6 +815,69 @@ describe('presence heartbeats', () => {
     });
     await assertFails(deleteDoc(beat(as(ALICE), BOB.uid)));
     await assertSucceeds(deleteDoc(beat(as(ALICE), ALICE.uid)));
+  });
+});
+
+/**
+ * The one exception to append-only. An auction has to be *archived* first — a
+ * flag on its doc — and then an admin may take it apart, subcollection by
+ * subcollection, since Firestore has no recursive delete. Nobody else may,
+ * and nothing in a live auction may be deleted by anyone.
+ */
+describe('archiving and deleting an auction', () => {
+  const auctionDoc = (db: ReturnType<typeof as>) => doc(db, 'auctions', AUCTION);
+  const archive = () =>
+    env.withSecurityRulesDisabled(async (ctx) => {
+      await updateDoc(doc(ctx.firestore(), 'auctions', AUCTION), { archived: true });
+    });
+  /**
+   * One doc from each subcollection that is otherwise immutable. Seats and
+   * credentials are not here: an auctioneer deleting a seat is how access is
+   * revoked, and credentials are admin-writable by design, so those two need
+   * nothing new from the rules to be cleared.
+   */
+  const pieces = (db: ReturnType<typeof as>) => [
+    eventRef(db, 9),
+    doc(db, 'auctions', AUCTION, 'users', ALICE_KEY),
+    doc(db, 'auctions', AUCTION, 'identities', ALICE_KEY),
+    doc(db, 'auctions', AUCTION, 'presence', 'uid-someone-else'),
+  ];
+
+  beforeEach(async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await setDoc(doc(ctx.firestore(), 'auctions', AUCTION, 'presence', 'uid-someone-else'), {
+        publicKey: BOB_KEY,
+        at: serverTimestamp(),
+      });
+    });
+  });
+
+  it('lets an owner archive and restore; refuses a supplier and the client', async () => {
+    await assertSucceeds(updateDoc(auctionDoc(as(OWNER)), { archived: true }));
+    await assertSucceeds(updateDoc(auctionDoc(as(ADMIN)), { archived: false }));
+    await assertFails(updateDoc(auctionDoc(as(ALICE)), { archived: true }));
+    await assertFails(updateDoc(auctionDoc(as(DAVE)), { archived: true }));
+  });
+
+  it('refuses deleting any part of a live auction, admin included', async () => {
+    for (const ref of pieces(as(ADMIN))) await assertFails(deleteDoc(ref));
+    await assertFails(deleteDoc(auctionDoc(as(ADMIN))));
+  });
+
+  it('lets only an admin dismantle an archived auction', async () => {
+    await archive();
+    // Still not a seated auctioneer's, a supplier's, or a stranger's to delete.
+    for (const who of [OWNER, ALICE, DAVE, STRANGER, ADMIN_UNVERIFIED]) {
+      await assertFails(deleteDoc(eventRef(as(who), 9)));
+      await assertFails(deleteDoc(auctionDoc(as(who))));
+    }
+    for (const ref of pieces(as(ADMIN))) await assertSucceeds(deleteDoc(ref));
+    await assertSucceeds(deleteDoc(auctionDoc(as(ADMIN))));
+  });
+
+  it('still refuses overwriting an archived auction\'s events', async () => {
+    await archive();
+    await assertFails(updateDoc(eventRef(as(ADMIN), 9), { auctionLength: 1 }));
   });
 });
 

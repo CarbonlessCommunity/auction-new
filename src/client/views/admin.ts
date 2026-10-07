@@ -3,10 +3,13 @@ import {
   auctionUrl,
   changeParticipantEmail,
   createParticipant,
+  deleteAuction,
   listAuctions,
   resetParticipantPassword,
   revokeParticipant,
   roster as loadRoster,
+  setArchived,
+  type AuctionListing,
   type RosterEntry,
 } from '../management';
 import { currentUser, reloadUser, signOutNow } from '../auth';
@@ -33,6 +36,8 @@ let scope: AbortController | null = null;
 let tokenRefreshed = false;
 /** The credentials of the last account created/changed, shown once. */
 let lastIssued: { auctionId: string; email: string; password?: string; preexisting: boolean } | null = null;
+/** Whether the list is showing the auctions that were put away. */
+let showArchived = false;
 
 export function renderAdmin(root: HTMLElement): void {
   window.addEventListener('hashchange', () => void mount(root));
@@ -144,29 +149,98 @@ async function renderList(root: HTMLElement, signal: AbortSignal): Promise<void>
   root.querySelector('[data-act="signout"]')?.addEventListener('click', signOutAndReload);
 
   const listEl = root.querySelector<HTMLElement>('#auction-list')!;
-  try {
-    const auctions = await listAuctions();
-    if (signal.aborted) return;
-    listEl.innerHTML = auctions.length
-      ? `<ul class="people">${auctions
-          .map(
-            (a) => `
-          <li>
-            <span class="grow">
-              <a href="#${encodeURIComponent(a.id)}"><strong>${escapeHtml(a.name)}</strong></a>
-              <br /><span class="muted">${a.createdAt ? new Date(a.createdAt).toLocaleString() : 'just now'}</span>
-            </span>
-            <a class="button" href="/a/${encodeURIComponent(a.id)}">open board</a>
-          </li>`,
-          )
-          .join('')}</ul>`
+  let auctions: AuctionListing[] = [];
+
+  function drawList(): void {
+    const shown = auctions.filter((a) => a.archived === showArchived);
+    const archivedCount = auctions.filter((a) => a.archived).length;
+    const toggle = archivedCount
+      ? `<p class="muted" style="margin:0 0 0.6rem">
+          <button class="link" data-act="toggle-archived">${
+            showArchived ? '← back to current auctions' : `show ${archivedCount} archived`
+          }</button></p>`
+      : '';
+    const empty = showArchived
+      ? '<p class="muted">Nothing archived.</p>'
       : '<p class="muted">No auctions yet — create one above.</p>';
-  } catch (err) {
-    if (signal.aborted) return;
-    listEl.innerHTML = `<p class="muted">Could not load auctions: ${escapeHtml(
-      err instanceof Error ? err.message : String(err),
-    )}</p>`;
+    listEl.innerHTML = toggle + (shown.length ? `<ul class="people">${shown.map(auctionRow).join('')}</ul>` : empty);
   }
+
+  function auctionRow(a: AuctionListing): string {
+    const actions = a.archived
+      ? `<button class="link" data-act="unarchive" data-id="${escapeHtml(a.id)}">restore</button>
+         <button class="link danger" data-act="delete" data-id="${escapeHtml(a.id)}" data-name="${escapeHtml(a.name)}">delete permanently</button>`
+      : `<a class="button" href="/a/${encodeURIComponent(a.id)}">open board</a>
+         <button class="link" data-act="archive" data-id="${escapeHtml(a.id)}" data-name="${escapeHtml(a.name)}">archive</button>`;
+    return `
+      <li class="roster-row">
+        <span class="grow">
+          <a href="#${encodeURIComponent(a.id)}"><strong>${escapeHtml(a.name)}</strong></a>
+          <span class="role">${escapeHtml(a.status)}</span>
+          <br /><span class="muted">${a.createdAt ? new Date(a.createdAt).toLocaleString() : 'just now'}</span>
+        </span>
+        <span class="roster-actions">${actions}</span>
+      </li>`;
+  }
+
+  async function reload(): Promise<void> {
+    try {
+      auctions = await listAuctions();
+      if (signal.aborted) return;
+      drawList();
+    } catch (err) {
+      if (signal.aborted) return;
+      listEl.innerHTML = `<p class="muted">Could not load auctions: ${escapeHtml(
+        err instanceof Error ? err.message : String(err),
+      )}</p>`;
+    }
+  }
+
+  listEl.addEventListener(
+    'click',
+    async (event) => {
+      const target = (event.target as HTMLElement).closest<HTMLElement>('[data-act]');
+      if (!target) return;
+      const act = target.dataset.act!;
+      const id = target.dataset.id ?? '';
+      const name = target.dataset.name ?? '';
+
+      if (act === 'toggle-archived') {
+        showArchived = !showArchived;
+        drawList();
+        return;
+      }
+      if (act === 'archive' || act === 'unarchive') {
+        if (act === 'archive' && !confirm(`Archive "${name}"? It leaves this list; the board and its links keep working, and you can restore it any time.`)) return;
+        const result = await setArchived(id, act === 'archive');
+        if (!result.ok) toast(result.error ?? 'Could not update the auction.', 'error');
+        await reload();
+        return;
+      }
+      if (act === 'delete') {
+        // Two gates, because this is the one thing in the app that cannot be
+        // undone: the auction must already be archived, and the name typed.
+        const typed = prompt(
+          `Delete "${name}" permanently? Every bid, participant and result goes with it, and the board link stops working.
+
+Type the auction's name to confirm:`,
+        );
+        if (typed === null) return;
+        if (typed.trim() !== name) {
+          toast('The name did not match — nothing was deleted.', 'warn');
+          return;
+        }
+        target.setAttribute('disabled', '');
+        const result = await deleteAuction(id);
+        if (!result.ok) toast(result.error ?? 'Could not delete the auction.', 'error');
+        else toast(`"${name}" was deleted.`);
+        await reload();
+      }
+    },
+    { signal },
+  );
+
+  await reload();
 }
 
 // --- one auction's participants ---------------------------------------

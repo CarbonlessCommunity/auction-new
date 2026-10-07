@@ -29,6 +29,8 @@ export const eventSchemas = {
   }),
   cancelBid: z.object({ type: z.literal('cancelBid'), bidSeq: z.number().int().min(0) }),
   startAuction: z.object({ type: z.literal('startAuction') }),
+  pauseAuction: z.object({ type: z.literal('pauseAuction') }),
+  resumeAuction: z.object({ type: z.literal('resumeAuction') }),
   showResults: z.object({ type: z.literal('showResults') }),
 } as const;
 
@@ -43,6 +45,8 @@ export const inboundRoles: Record<keyof typeof eventSchemas, readonly Role[]> = 
   // sometimes on purpose. `validateInbound` is what holds them to their own.
   cancelBid: ['owner', 'bidder'],
   startAuction: ['owner'],
+  pauseAuction: ['owner'],
+  resumeAuction: ['owner'],
   showResults: ['owner'],
 };
 

@@ -1,4 +1,15 @@
-import { collection, deleteDoc, getDoc, getDocs, runTransaction, serverTimestamp, setDoc, updateDoc } from 'firebase/firestore';
+import {
+  collection,
+  deleteDoc,
+  getDoc,
+  getDocs,
+  runTransaction,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  writeBatch,
+  type CollectionReference,
+} from 'firebase/firestore';
 import { db } from './firebase';
 import {
   createParticipantAccount,
@@ -14,6 +25,7 @@ import type { AddUserInput, AuctionConfig, Role } from '../shared/types';
 import type { Connection } from './connection';
 import {
   type ApiResult,
+  type AuctionDocData,
   type CredentialDocData,
   type IdentityDocData,
   type SeatDocData,
@@ -21,12 +33,15 @@ import {
   credentialRef,
   credentialsCol,
   eventRef,
+  eventsCol,
   identitiesCol,
   identityRef,
+  presenceCol,
   requireUser,
   seatRef,
   seatsCol,
   userRef,
+  usersCol,
 } from './store';
 
 /**
@@ -72,19 +87,104 @@ export function auctionUrl(auctionId: string): string {
   return `${location.origin}/a/${auctionId}`;
 }
 
+/** One row of the admin panel's auction list. */
+export interface AuctionListing {
+  id: string;
+  name: string;
+  createdAt: number | null;
+  /** Where it stands, for the list to say at a glance. */
+  status: 'not started' | 'running' | 'paused' | 'ended' | 'results released';
+  archived: boolean;
+}
+
 /** Every auction, newest first — the admin panel's list. Admins only (by rule). */
-export async function listAuctions(): Promise<Array<{ id: string; name: string; createdAt: number | null }>> {
+export async function listAuctions(): Promise<AuctionListing[]> {
   const snap = await getDocs(collection(db, 'auctions'));
+  const nowSec = Date.now() / 1000;
   return snap.docs
     .map((docSnap) => {
-      const data = docSnap.data() as { name?: string; createdAt?: { toMillis?: () => number } };
+      const data = docSnap.data() as Partial<AuctionDocData> & { createdAt?: { toMillis?: () => number } };
+      const started = typeof data.startedAt === 'number';
+      // Read off the mirror fields, which is all a list can afford: a running
+      // auction's exact phase is the board's business.
+      const status: AuctionListing['status'] = data.showResults
+        ? 'results released'
+        : !started
+          ? 'not started'
+          : data.pausedAt != null
+            ? 'paused'
+            : nowSec > data.startedAt! + (data.auctionLength ?? 0)
+              ? 'ended'
+              : 'running';
       return {
         id: docSnap.id,
         name: data.name ?? '(untitled)',
         createdAt: data.createdAt?.toMillis?.() ?? null,
+        status,
+        archived: data.archived === true,
       };
     })
     .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+}
+
+/**
+ * Takes an auction off the panel's list, or puts it back. Reversible, changes
+ * nothing on the board — and it is the precondition for {@link deleteAuction},
+ * which is what keeps a live auction's log out of reach of a stray click.
+ */
+export async function setArchived(auctionId: string, archived: boolean): Promise<ApiResult> {
+  try {
+    await updateDoc(auctionRef(auctionId), { archived });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Could not update the auction.' };
+  }
+}
+
+/** Firestore takes at most 500 writes in a batch. */
+const DELETE_BATCH = 400;
+
+/**
+ * Permanently removes an archived auction: every document in every
+ * subcollection, then the auction itself. Firestore has no recursive delete,
+ * so this walks them — and the rules only let an admin do so once the auction
+ * is archived, so a live log can never be deleted by any client.
+ *
+ * Participants' Firebase Auth accounts are left alone: with no seat they get
+ * nowhere, and the same address may be seated in another auction.
+ */
+export async function deleteAuction(auctionId: string): Promise<ApiResult> {
+  try {
+    const snap = await getDoc(auctionRef(auctionId));
+    if (!snap.exists()) return { ok: false, error: 'No such auction.' };
+    if ((snap.data() as AuctionDocData).archived !== true) {
+      return { ok: false, error: 'Archive the auction first, then delete it.' };
+    }
+
+    // Seats go first: an archived auction's board still works, and a supplier
+    // with a seat could otherwise land a bid after the log was purged,
+    // leaving an orphan behind. Without a seat the rules refuse it.
+    const subcollections: CollectionReference[] = [
+      seatsCol(auctionId),
+      credentialsCol(auctionId),
+      presenceCol(auctionId),
+      eventsCol(auctionId),
+      usersCol(auctionId),
+      identitiesCol(auctionId),
+    ];
+    for (const col of subcollections) {
+      const docs = (await getDocs(col)).docs;
+      for (let i = 0; i < docs.length; i += DELETE_BATCH) {
+        const batch = writeBatch(db);
+        for (const d of docs.slice(i, i + DELETE_BATCH)) batch.delete(d.ref);
+        await batch.commit();
+      }
+    }
+    await deleteDoc(auctionRef(auctionId));
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Could not delete the auction.' };
+  }
 }
 
 export interface CreateAuctionInput {

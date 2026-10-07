@@ -60,6 +60,10 @@ npm run dev:emulator
 | `npm run build` | Bundles the client to `dist/client/` |
 | `npm run deploy` | Builds, then deploys hosting + Firestore rules |
 
+All four suites also run on every push and pull request in GitHub Actions
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), against throwaway
+emulators there too.
+
 The emulator scripts need a Java runtime; they put Homebrew's `openjdk` on `PATH`
 themselves, so `brew install openjdk` is the only setup.
 
@@ -153,6 +157,16 @@ The admin panel is the operational view of this: every participant, their
 address, whether they have actually signed in yet, the password on file, and
 buttons to re-credential, correct a mistyped address, or remove access. The
 board's own **People** panel is read-only.
+
+The panel's auction list says where each auction stands (not started, running,
+paused, ended, results released) and is where an auction is put away. **Archive**
+takes it off the list and changes nothing else — the board and its links keep
+working, and it can be restored. **Delete** is only offered on an archived
+auction, asks for the name typed back, and then removes every bid, participant
+and result for good; the board link stops working on every screen. The two
+steps are deliberate: the security rules refuse to delete any part of an
+auction that is not archived, so a live log cannot be lost to a stray click
+(see [Trust model](#trust-model)).
 
 (Earlier designs used a bearer invite link, then a passwordless email-link
 sign-in. The link bound a slot to one browser and could not tell a supplier
@@ -271,6 +285,15 @@ twelve people on twelve machines:
   typed as 0.0057), or a bid of zero, gets one plain question before it lands.
   Withdrawal exists for the ones that get through, but a wrong bid that sits on
   the board for a minute moves everyone else.
+- **Pause.** A dropped call, a dispute, a supplier who cannot get in: the
+  auctioneer can stop the clock while it runs and restart it later. Every
+  screen shows *Paused*, the bid boxes go away, and the pause's length is
+  added to the run so the clock resumes at the reading it stopped on. Paused
+  inside Last Call it stays Last Call, and stays blind. Both are events in
+  the log like everything else (`pauseAuction`, `resumeAuction`), so a
+  replay reproduces the stretched clock, the audit checks the arithmetic,
+  and — the one piece of clock-keeping the rules *can* enforce — Firestore
+  refuses any bid while the auction doc says the clock is stopped.
 - **Audit log.** Once the auction has started the auctioneer has an *Audit
   log* button that replays the whole log through the same `validateInbound`
   every screen uses and lists anything it would have refused — see
@@ -286,11 +309,15 @@ reads:
 - only an admin (a hard-coded, *verified* address) can create an auction, issue
   admin events, seat or unseat anyone, or read a participant's stored password;
 - a supplier cannot read another supplier's name, email or password by any route;
-- a supplier can bid only as itself, and cannot forge the `placedBy` marker that
-  denotes an auctioneer bidding on someone's behalf;
+- a supplier can bid only as itself, only while the clock is not paused, and
+  cannot forge the `placedBy` marker that denotes an auctioneer bidding on
+  someone's behalf;
 - a supplier can withdraw only their own bid, and the watching client can write
   nothing at all;
-- events are append-only and gapless — no overwrite, no delete, no seq gaps;
+- events are append-only and gapless — no overwrite, no delete, no seq gaps.
+  The one exception: an admin may delete, piece by piece, an auction that has
+  first been *archived*, which is how the panel's permanent delete works;
+  nothing in a live auction can be deleted by anyone;
 - a supplier's paired clock bump is bounded, so it can neither end the auction
   early nor stall it;
 - a seat holder can change nothing about their own seat but the sign-in stamp.
@@ -354,15 +381,19 @@ src/shared/     types, rules, config, schemas, aggregate, validation, audit, adm
 src/client/     firebase, auth (email/password + secondary-app account
                 provisioning), store (document shapes + refs), connection (the
                 live board: transactional append, listeners, seat resolution,
-                heartbeats/clock), management (the admin panel: create and list
-                auctions, seat / re-credential / unseat participants, roster),
+                heartbeats/clock), management (the admin panel: create, list,
+                archive and delete auctions, seat / re-credential / unseat
+                participants, roster),
                 views (sign-in, create, admin panel, auction board, chart,
                 presence), export, format
 firestore.rules the enforcement boundary — read the header comment
 tests/          domain rules, bid comparison, validation, audit
 tests/rules/    security rules, against the emulator
 tests/e2e/      Playwright smoke test: admin seats two suppliers, they trade the
-                lead, Last Call goes blind, results release, the audit passes
+                lead, the clock is paused and resumed, Last Call goes blind,
+                results release, the audit passes, the auction is archived
+                and deleted
+.github/        CI: every suite, on every push
 ```
 
 ## Notes

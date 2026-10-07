@@ -120,3 +120,32 @@ describe('auditLog', () => {
     expect(auditLog('test', ctx.config, ctx.log).findings).toEqual([]);
   });
 });
+
+describe('auditLog and a paused clock', () => {
+  it('passes a genuine pause and resume, and flags a resume that stretched the run too far', () => {
+    const ctx = startedAuction();
+    const { submit, owner, alice, lot, log, config } = ctx;
+    submit({ type: 'placeBid', lotId: lot, value: 0.07 }, alice, T0 + 10);
+    submit({ type: 'pauseAuction' }, owner, T0 + 20);
+    submit({ type: 'resumeAuction' }, owner, T0 + 50);
+    submit({ type: 'placeBid', lotId: lot, value: 0.069 }, alice, T0 + 60);
+    expect(auditLog('test', config, log).findings).toEqual([]);
+
+    const forged = log.map((event) =>
+      event.type === 'resumeAuction' ? { ...event, auctionLength: (event.auctionLength as number) + 600 } : event,
+    );
+    const report = auditLog('test', config, forged);
+    expect(report.findings).toHaveLength(1);
+    expect(report.findings[0].type).toBe('resumeAuction');
+  });
+
+  it('flags a bid that landed while the clock was paused', () => {
+    const { submit, owner, alice, lot, log, config } = startedAuction();
+    submit({ type: 'pauseAuction' }, owner, T0 + 20);
+    const smuggled: AuctionEvent = {
+      type: 'placeBid', seq: log.length, time: T0 + 30, lotId: lot, bidder: alice.publicKey, value: 0.07,
+    };
+    const report = auditLog('test', config, [...log, smuggled]);
+    expect(report.findings.map((f) => f.seq)).toEqual([smuggled.seq]);
+  });
+});

@@ -61,6 +61,13 @@ export class AuctionAggregate {
   startTime: number | null = null;
   /** The whole run in seconds — main clock plus Last Call, extensions included. */
   auctionLength: number;
+  /**
+   * The instant the auctioneer stopped the clock, or null while it runs. While
+   * set, every clock reading is taken *as of this instant* rather than now, so
+   * the board holds exactly where it was; a resume adds the pause's length to
+   * `auctionLength`, which puts the clock back where it stopped.
+   */
+  pausedAt: number | null = null;
   showResultsReleased = false;
 
   constructor(id: string, config: AuctionConfig) {
@@ -146,6 +153,17 @@ export class AuctionAggregate {
         this.auctionLength = event.auctionLength as number;
         break;
 
+      case 'pauseAuction':
+        this.pausedAt = event.time;
+        break;
+
+      case 'resumeAuction':
+        this.pausedAt = null;
+        // Carries the stretched run, like an Extended Time bid, so a replay
+        // reproduces the clock without re-deriving the pause's length.
+        if (typeof event.auctionLength === 'number') this.auctionLength = event.auctionLength;
+        break;
+
       case 'showResults':
         this.showResultsReleased = true;
         break;
@@ -175,9 +193,18 @@ export class AuctionAggregate {
     return this.startTime === null ? null : this.startTime + this.auctionLength;
   }
 
+  /**
+   * The instant the clock is read at: now, or — while paused — the instant it
+   * stopped. Every clock question goes through this, so a pause freezes the
+   * phase, the countdown and the blind window alike.
+   */
+  clockNow(now: number): number {
+    return this.pausedAt === null ? now : Math.min(now, this.pausedAt);
+  }
+
   remaining(now: number): number {
     if (this.startTime === null) return this.auctionLength;
-    return this.startTime + this.auctionLength - now;
+    return this.startTime + this.auctionLength - this.clockNow(now);
   }
 
   /**
@@ -208,19 +235,25 @@ export class AuctionAggregate {
   isBlindWindow(now: number): boolean {
     const start = this.blindStart();
     if (start === null || this.showResultsReleased) return false;
-    return now >= start;
+    return this.clockNow(now) >= start;
   }
 
   phase(now: number): AuctionPhase {
     const { lastCallSec, extendedTimeThresholdSec } = this.config;
     const remaining = this.remaining(now);
     const started = this.startTime !== null;
-    const isRunning = started && remaining > 0;
+    // Where the clock stands — which stretch of the run it is in — is the same
+    // paused or not; only whether it is *moving* differs. So a pause inside
+    // Last Call still reads as Last Call (the board stays blind), but nothing
+    // that needs a running clock, a bid above all, is allowed through.
+    const live = started && remaining > 0;
+    const isPaused = live && this.pausedAt !== null;
 
     return {
-      isRunning,
-      isInLastCall: isRunning && remaining <= lastCallSec,
-      isInExtendedTime: isRunning && remaining > lastCallSec && remaining - lastCallSec <= extendedTimeThresholdSec,
+      isRunning: live && !isPaused,
+      isPaused,
+      isInLastCall: live && remaining <= lastCallSec,
+      isInExtendedTime: live && remaining > lastCallSec && remaining - lastCallSec <= extendedTimeThresholdSec,
       isCompleted: started && remaining <= 0,
       startTime: this.startTime,
       auctionLength: this.auctionLength,

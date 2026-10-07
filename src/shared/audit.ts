@@ -142,6 +142,12 @@ function reconstruct(
     case 'startAuction':
       return { input: { type: 'startAuction' }, actor: SYSTEM };
 
+    case 'pauseAuction':
+      return { input: { type: 'pauseAuction' }, actor: SYSTEM };
+
+    case 'resumeAuction':
+      return { input: { type: 'resumeAuction' }, actor: SYSTEM };
+
     case 'showResults':
       return { input: { type: 'showResults' }, actor: SYSTEM };
 
@@ -205,6 +211,15 @@ function compare(stored: AuctionEvent, recomputed: AuctionEvent): string[] {
         problems.push(`Started a ${stored.auctionLength}s run where the rules say ${recomputed.auctionLength}s.`);
       }
       break;
+
+    case 'resumeAuction': {
+      const storedLength = typeof stored.auctionLength === 'number' ? stored.auctionLength : NaN;
+      const expected = recomputed.auctionLength as number;
+      if (!(Math.abs(storedLength - expected) <= LENGTH_SLACK_SEC)) {
+        problems.push(`Resumed with a ${storedLength}s run where the pause's length says ${expected.toFixed(1)}s.`);
+      }
+      break;
+    }
   }
 
   return problems;
