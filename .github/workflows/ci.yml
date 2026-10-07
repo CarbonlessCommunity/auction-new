@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # The Firestore and Auth emulators are Java programs.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit -p tsconfig.json
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Install the Firebase CLI
+        run: npm install -g firebase-tools@13
+
+      - name: Cache emulator jars
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/firebase/emulators
+          key: firebase-emulators-${{ runner.os }}
+
+      # The npm scripts prepend Homebrew's JDK to PATH, which does not exist
+      # here, so the emulator wrapper is invoked directly.
+      - name: Security rules
+        run: firebase emulators:exec --only firestore --project carbonless-auction "npx vitest run --config vitest.rules.config.ts"
+
+      - name: Install Playwright's Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: End to end
+        run: firebase emulators:exec --only auth,firestore --project carbonless-auction "npx playwright test"
+        env:
+          CI: 1
+
+      - name: Keep the Playwright trace on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: test-results/
+          if-no-files-found: ignore
